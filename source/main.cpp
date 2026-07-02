@@ -1,0 +1,1814 @@
+/*
+ * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.0
+ * ---------------------------------------------------------------------------
+ * Swaps the active mod for a game by MOVING folders between a central
+ * per-title mod repository and the game's "active" location:
+ *
+ *   Stored (all games) : sdmc:/3ds/3dsmods/<TitleID>/<mod name>
+ *   Active (most games): sdmc:/luma/titles/<TitleID>        (Luma LayeredFS)
+ *   Active (Smash 3DS) : sdmc:/saltysd/smash                (SaltySD)
+ *
+ * Smash 3DS packs its data inside dt/ls archives in romfs, so plain LayeredFS
+ * cannot replace individual files. SaltySD is a code.ips patch (applied by
+ * Luma game patching from luma/titles/<SmashTID>/code.ips) that redirects the
+ * game's file loads to sdmc:/saltysd/smash/. This app therefore:
+ *   - swaps Smash mod folders in/out of saltysd/smash, unwrapping the mod's
+ *     romfs/ subfolder on activation (SaltySD reads animcmd/, model/, ...
+ *     directly from saltysd/smash) and re-wrapping it on return to the repo,
+ *   - keeps the SaltySD loader (code.ips) alive in luma/titles/<SmashTID>/,
+ *     self-healing from a pristine copy at the repo root (preferred) or any
+ *     mod folder that carries one.
+ *
+ * Activating a stored mod (name-preserving, never deletes anything):
+ *   1. If a mod is active, move it back into the repo under its own name.
+ *   2. Move the selected stored mod into the active location.
+ * Disabling moves the active mod back to the repo -> the game boots vanilla.
+ *
+ * "Tidy" (Y) migrates every legacy location into the repo:
+ *   - loose luma/titles/<TitleID>_<mod> and Disabled<TitleID> folders
+ *   - ModMoon slot folders: 3ds/ModMoon/<TitleID>/<Slot_N>
+ *   - stray saltysd/<Slot_N> folders (Smash only)
+ *
+ * Game names resolve from the installed title's SMDH metadata; gamename.txt
+ * overrides; a small offline table covers uninstalled games.
+ *
+ * UI: citro2d, animated background, selectable color themes (SELECT button).
+ *
+ * Build: libctru + citro2d / devkitARM
+ */
+
+#include <citro2d.h>
+#include <3ds.h>
+#include <dirent.h>       // POSIX directory iteration (opendir/readdir)
+#include <sys/stat.h>     // mkdir
+#include <unistd.h>       // rmdir
+#include <cctype>         // tolower
+#include <cmath>          // sinf
+#include <cstdarg>        // va_list (smdh lookup trace)
+#include <cstdio>         // fopen/fgets/rename
+#include <cstdlib>        // strtoull / rand
+#include <cstring>        // strcmp/strchr/strlen
+#include <algorithm>      // std::sort / std::find_if / std::min
+#include <string>
+#include <utility>        // std::pair (game icon cache)
+#include <vector>
+
+// ---------------------------------------------------------------------------
+// Locations
+// ---------------------------------------------------------------------------
+static const char *LUMA_TITLES  = "sdmc:/luma/titles";
+static const char *MOD_REPO     = "sdmc:/3ds/3dsmods";
+static const char *MODMOON_REPO = "sdmc:/3ds/ModMoon";   // imported by Tidy
+static const char *SETTINGS_TXT = "sdmc:/3ds/3dsmods/settings.txt";
+
+// SaltySD-managed titles: their active mod lives in a fixed SD folder that the
+// SaltySD code patch reads, NOT in luma/titles. The loader (code.ips) must
+// stay in luma/titles/<TitleID>/ for Luma game patching to apply it.
+static const char *SALTY_TITLE_ID = "00040000000EDF00";  // Super Smash Bros.
+static const char *SALTY_ACTIVE   = "sdmc:/saltysd/smash";
+static const char *SALTY_PARENT   = "sdmc:/saltysd";
+
+// Per-folder marker files holding a mod's human-readable name (modname.txt
+// preferred; desc.txt, used by ModMoon, is read as a fallback).
+static const char *MARKER_FILE   = "modname.txt";
+static const char *ALT_MARKER    = "desc.txt";
+
+// Optional per-title file holding the game's display name (overrides SMDH).
+static const char *GAMENAME_FILE = "gamename.txt";
+
+// Name written for an active mod that carries no marker of its own.
+static const std::string FALLBACK_NAME = "Previous";
+
+// ---------------------------------------------------------------------------
+// Offline fallback names, used only when a title's SMDH can't be read (game
+// not installed on this console). gamename.txt and SMDH both take priority.
+// ---------------------------------------------------------------------------
+struct NamedTitle { const char *id; const char *name; };
+static const NamedTitle TITLE_NAMES[] = {
+    { "00040000000EDF00", "Super Smash Bros. (3DS)"    },
+    { "000400000007AF00", "YouTube"                    },
+    { "0004000000287000", "CTRXplorer"                 },
+    { "0004000000030800", "Mario Kart 7"               },
+    { "0004000000053F00", "Super Mario 3D Land"        },
+    { "00040000001B8700", "Minecraft: New 3DS Edition" },
+    { "00040000001B5000", "Pokemon Ultra Sun"          },
+    { "00040000001D1A00", "Luigi's Mansion"            },
+};
+
+// ---------------------------------------------------------------------------
+// Themes
+// ---------------------------------------------------------------------------
+#define RGBA8C(r,g,b,a) C2D_Color32(r, g, b, a)
+#define RGB8(r,g,b)     C2D_Color32(r, g, b, 0xFF)
+
+struct Theme {
+    const char *name;
+    u32 bgTop, bgBot;      // background gradient
+    u32 panel, panel2;     // chrome / inset
+    u32 accent, secondary, info;   // hue trio (headers, pills, particles)
+    u32 selL, selR;        // selection bar gradient
+    u32 text, muted;       // typography
+};
+
+static const Theme THEMES[] = {
+    { "Midnight",
+      RGB8(0x12,0x13,0x1F), RGB8(0x26,0x1E,0x3C),
+      RGBA8C(0x24,0x28,0x3B,0xEE), RGB8(0x2F,0x35,0x49),
+      RGB8(0x7A,0xA2,0xF7), RGB8(0xBB,0x9A,0xF7), RGB8(0x2A,0xC3,0xDE),
+      RGB8(0x3D,0x59,0xA1), RGB8(0x55,0x3D,0x8F),
+      RGB8(0xC0,0xCA,0xF5), RGB8(0x6E,0x77,0xA8) },
+    { "Crimson",
+      RGB8(0x1C,0x0E,0x13), RGB8(0x3A,0x12,0x20),
+      RGBA8C(0x33,0x1A,0x24,0xEE), RGB8(0x47,0x21,0x2E),
+      RGB8(0xF7,0x76,0x8E), RGB8(0xFF,0x9E,0x64), RGB8(0xE0,0xAF,0x68),
+      RGB8(0x8A,0x2A,0x3C), RGB8(0xA3,0x45,0x67),
+      RGB8(0xF2,0xD5,0xDC), RGB8(0x9A,0x6B,0x78) },
+    { "Ocean",
+      RGB8(0x0B,0x16,0x22), RGB8(0x0E,0x3A,0x44),
+      RGBA8C(0x14,0x2A,0x3C,0xEE), RGB8(0x1E,0x3A,0x50),
+      RGB8(0x2A,0xC3,0xDE), RGB8(0x7A,0xA2,0xF7), RGB8(0x73,0xDA,0xCA),
+      RGB8(0x1D,0x5F,0x8A), RGB8(0x2A,0x8F,0xA6),
+      RGB8(0xC5,0xE4,0xF0), RGB8(0x5E,0x88,0xA0) },
+    { "Emerald",
+      RGB8(0x0D,0x17,0x12), RGB8(0x14,0x33,0x2A),
+      RGBA8C(0x18,0x2E,0x26,0xEE), RGB8(0x22,0x40,0x38),
+      RGB8(0x9E,0xCE,0x6A), RGB8(0x73,0xDA,0xCA), RGB8(0xE0,0xAF,0x68),
+      RGB8(0x2E,0x6B,0x4F), RGB8(0x3F,0x8A,0x5A),
+      RGB8(0xD2,0xEB,0xD8), RGB8(0x6E,0x93,0x7E) },
+    { "Sunset",
+      RGB8(0x1D,0x10,0x26), RGB8(0x4A,0x1E,0x33),
+      RGBA8C(0x33,0x1E,0x3A,0xEE), RGB8(0x45,0x2B,0x4E),
+      RGB8(0xFF,0x9E,0x64), RGB8(0xBB,0x9A,0xF7), RGB8(0xF7,0x76,0x8E),
+      RGB8(0x7A,0x3B,0x5E), RGB8(0xA8,0x5A,0x3C),
+      RGB8(0xF0,0xDC,0xE5), RGB8(0x9C,0x7A,0x96) },
+    { "Slate",
+      RGB8(0x15,0x17,0x1A), RGB8(0x2A,0x2E,0x36),
+      RGBA8C(0x24,0x28,0x2E,0xEE), RGB8(0x33,0x38,0x3F),
+      RGB8(0xAA,0xB2,0xC0), RGB8(0x8A,0x93,0xA5), RGB8(0xC9,0xD1,0xDC),
+      RGB8(0x3E,0x46,0x54), RGB8(0x4C,0x55,0x68),
+      RGB8(0xD5,0xDA,0xE2), RGB8(0x6E,0x76,0x84) },
+};
+static const int NUM_THEMES = (int)(sizeof(THEMES) / sizeof(THEMES[0]));
+static int g_themeIdx = 0;
+#define T (THEMES[g_themeIdx])
+
+// Fixed semantic colors, shared by every theme.
+static const u32 CLR_WHITE  = RGB8(0xFF, 0xFF, 0xFF);
+static const u32 CLR_GREEN  = RGB8(0x9E, 0xCE, 0x6A);  // active / success
+static const u32 CLR_YELLOW = RGB8(0xE0, 0xAF, 0x68);  // warnings
+static const u32 CLR_RED    = RGB8(0xF7, 0x76, 0x8E);  // errors
+static const u32 CLR_ORANGE = RGB8(0xFF, 0x9E, 0x64);  // loose / caution
+static const u32 CLR_DARK   = RGB8(0x16, 0x16, 0x1E);  // text on bright pills
+
+// System-font button glyphs (3DS shared font private-use area,
+// U+E000..U+E006 encoded as explicit UTF-8 so no editor can strip them).
+#define G_A    "\xEE\x80\x80"
+#define G_B    "\xEE\x80\x81"
+#define G_X    "\xEE\x80\x82"
+#define G_Y    "\xEE\x80\x83"
+#define G_DPAD "\xEE\x80\x86"
+
+// Bottom-screen list geometry.
+static const int   LIST_ROWS = 6;
+static const float ROW_H     = 28.0f;
+static const float LIST_Y    = 30.0f;
+
+// Global animation clock, advanced once per frame (~1/60 s).
+static float g_t = 0.0f;
+
+// ---------------------------------------------------------------------------
+// Small string / filesystem helpers
+// ---------------------------------------------------------------------------
+
+// Trim trailing whitespace / line endings in place.
+static void rtrim(std::string &s)
+{
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' ||
+                          s.back() == ' '  || s.back() == '\t'))
+        s.pop_back();
+}
+
+// True if path exists and opens as a directory.
+static bool isDir(const std::string &path)
+{
+    DIR *d = opendir(path.c_str());
+    if (d) { closedir(d); return true; }
+    return false;
+}
+
+// True if the directory exists and holds at least one entry. Empty leftover
+// folders in luma/titles (created by tools, never filled) are not mods.
+static bool dirNonEmpty(const std::string &path)
+{
+    DIR *d = opendir(path.c_str());
+    if (!d) return false;
+    struct dirent *ent;
+    bool any = false;
+    while ((ent = readdir(d)) != NULL) {
+        if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
+        any = true;
+        break;
+    }
+    closedir(d);
+    return any;
+}
+
+// True if path exists and opens as a file.
+static bool fileExists(const std::string &path)
+{
+    FILE *f = fopen(path.c_str(), "rb");
+    if (f) { fclose(f); return true; }
+    return false;
+}
+
+// Read the first line of a file, trimmed. "" if missing/empty.
+static std::string readFirstLine(const std::string &path)
+{
+    FILE *f = fopen(path.c_str(), "r");
+    if (!f) return "";
+    char buf[256] = {0};
+    std::string s;
+    if (fgets(buf, sizeof(buf), f))
+        s = buf;
+    fclose(f);
+    rtrim(s);
+    return s;
+}
+
+// Byte-for-byte file copy (used to restore the SaltySD loader).
+static bool copyFile(const std::string &src, const std::string &dst)
+{
+    FILE *in = fopen(src.c_str(), "rb");
+    if (!in) return false;
+    FILE *out = fopen(dst.c_str(), "wb");
+    if (!out) { fclose(in); return false; }
+
+    static u8 buf[64 * 1024];
+    bool ok = true;
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) { ok = false; break; }
+    }
+    if (ferror(in)) ok = false;
+    fclose(in);
+    fclose(out);
+    if (!ok) remove(dst.c_str());
+    return ok;
+}
+
+// True if name is exactly 16 hexadecimal characters (a 3DS Title ID).
+static bool isTitleId(const char *name)
+{
+    if (strlen(name) != 16) return false;
+    for (int i = 0; i < 16; ++i) {
+        char c = name[i];
+        const bool hex = (c >= '0' && c <= '9') ||
+                         (c >= 'A' && c <= 'F') ||
+                         (c >= 'a' && c <= 'f');
+        if (!hex) return false;
+    }
+    return true;
+}
+
+// Case-insensitive string equality. FAT32 names are case-insensitive, so every
+// Title ID comparison in this file must go through here (or istartsWith).
+static bool iequals(const std::string &a, const std::string &b)
+{
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i]))
+            return false;
+    return true;
+}
+
+// Case-insensitive "does s start with prefix".
+static bool istartsWith(const std::string &s, const std::string &prefix)
+{
+    if (s.size() < prefix.size()) return false;
+    for (size_t i = 0; i < prefix.size(); ++i)
+        if (tolower((unsigned char)s[i]) != tolower((unsigned char)prefix[i]))
+            return false;
+    return true;
+}
+
+// If `name` belongs to a game, return its 16-hex Title ID; otherwise "".
+// Recognised folder shapes (so a game stays visible regardless of its state):
+//   <TitleID>            the ACTIVE mod folder (or SaltySD loader home)
+//   <TitleID>_<mod>      a legacy loose stored mod
+//   Disabled<TitleID>    a legacy (ModMoon-style) disabled active mod
+static std::string titleIdOf(const char *name)
+{
+    if (isTitleId(name)) return name;
+
+    const std::string s = name;
+
+    if (s.size() > 17 && s[16] == '_') {
+        std::string id = s.substr(0, 16);
+        if (isTitleId(id.c_str())) return id;
+    }
+
+    static const std::string DIS = "Disabled";
+    if (s.size() == DIS.size() + 16 && istartsWith(s, DIS)) {
+        std::string id = s.substr(DIS.size());
+        if (isTitleId(id.c_str())) return id;
+    }
+
+    return "";
+}
+
+// Make a display name safe as a FAT32 folder name: strip forbidden characters
+// and trailing dots/spaces (FAT32 rejects names ending in either).
+static std::string sanitizeName(const std::string &in)
+{
+    std::string out;
+    for (char c : in)
+        if (!strchr("\\/:*?\"<>|", c) && (unsigned char)c >= 0x20)
+            out += c;
+    rtrim(out);
+    while (!out.empty() && out.back() == '.')
+        out.pop_back();
+    rtrim(out);
+    if (out.empty()) out = "mod";
+    return out;
+}
+
+// Replace malformed UTF-8 sequences with '?' so marker files saved in odd
+// encodings can't feed garbage into the text renderer.
+static std::string utf8Sanitize(const std::string &in)
+{
+    std::string out;
+    size_t i = 0, n = in.size();
+    while (i < n) {
+        unsigned char c = in[i];
+        int len = (c < 0x80) ? 1 :
+                  ((c & 0xE0) == 0xC0) ? 2 :
+                  ((c & 0xF0) == 0xE0) ? 3 :
+                  ((c & 0xF8) == 0xF0) ? 4 : 0;
+        bool ok = (len > 0) && (i + len <= n);
+        if (len == 1) ok = (c >= 0x20 && c != 0x7F);   // drop control chars
+        for (int k = 1; ok && k < len; ++k)
+            ok = ((unsigned char)in[i + k] & 0xC0) == 0x80;
+        if (ok) { out.append(in, i, len); i += len; }
+        else    { out += '?'; ++i; }
+    }
+    return out;
+}
+
+// mkdir -p for an "sdmc:/a/b/c" path (creates every component, ignores EEXIST).
+static void mkdirs(const std::string &path)
+{
+    size_t pos = path.find(":/");
+    if (pos == std::string::npos) return;
+    pos += 2;
+    while (true) {
+        size_t slash = path.find('/', pos);
+        std::string sub = (slash == std::string::npos) ? path : path.substr(0, slash);
+        mkdir(sub.c_str(), 0777);
+        if (slash == std::string::npos) break;
+        pos = slash + 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Data model
+// ---------------------------------------------------------------------------
+
+// One swappable game, keyed by its 16-hex Title ID.
+struct GameProfile {
+    std::string title;     // resolved display name
+    std::string titleId;   // 16-hex Title ID
+    int         modCount;  // total mods known for this game (UI stats)
+    bool        hasActive; // a mod currently occupies the active location
+};
+
+// A single mod discovered for a game.
+struct ModEntry {
+    std::string display;  // human-readable name
+    std::string path;     // full path of this mod's source folder
+    bool        active;   // occupies the active location right now
+    bool        loose;    // legacy-location folder (luma/titles, ModMoon, ...)
+};
+
+// A legacy-location folder eligible for Tidy.
+struct LooseItem {
+    std::string path;      // full path of the folder
+    std::string fallback;  // display name if it has no marker file
+};
+
+// Status toast shown on the bottom screen.
+enum StatusKind { SK_NEUTRAL, SK_OK, SK_WARN, SK_ERR };
+struct Status {
+    std::string msg;
+    StatusKind  kind;
+};
+
+// ---------------------------------------------------------------------------
+// Path builders
+// ---------------------------------------------------------------------------
+
+// SaltySD titles keep their loader in luma/titles but their ACTIVE mod content
+// in the SaltySD redirect folder.
+static bool isSalty(const GameProfile &gp)
+{
+    return iequals(gp.titleId, SALTY_TITLE_ID);
+}
+
+static std::string lumaPath(const GameProfile &gp)
+{
+    return std::string(LUMA_TITLES) + "/" + gp.titleId;
+}
+static std::string activePath(const GameProfile &gp)
+{
+    return isSalty(gp) ? std::string(SALTY_ACTIVE) : lumaPath(gp);
+}
+static std::string repoPath(const GameProfile &gp)
+{
+    return std::string(MOD_REPO) + "/" + gp.titleId;
+}
+static std::string repoModPath(const GameProfile &gp, const std::string &name)
+{
+    return repoPath(gp) + "/" + name;
+}
+static std::string modmoonPath(const GameProfile &gp)
+{
+    return std::string(MODMOON_REPO) + "/" + gp.titleId;
+}
+
+// Display name for a mod folder: modname.txt, then desc.txt, then `fallback`.
+static std::string modDisplayName(const std::string &folderPath,
+                                  const std::string &fallback)
+{
+    std::string n = readFirstLine(folderPath + "/" + MARKER_FILE);
+    if (n.empty()) n = readFirstLine(folderPath + "/" + ALT_MARKER);
+    if (n.empty()) n = fallback;
+    return utf8Sanitize(n);
+}
+
+// Pick a repo folder name based on `base`, appending " (2)", " (3)", ... if a
+// folder of that name already exists.
+static std::string uniqueRepoFolder(const GameProfile &gp, const std::string &base)
+{
+    if (!isDir(repoModPath(gp, base))) return base;
+    for (int n = 2; ; ++n) {
+        std::string cand = base + " (" + std::to_string(n) + ")";
+        if (!isDir(repoModPath(gp, cand))) return cand;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SaltySD loader upkeep
+// ---------------------------------------------------------------------------
+
+// Cached result of the last loader check, shown in the mod-menu header.
+static bool g_saltyLoaderOk = true;
+
+// Ensure luma/titles/<SmashTID>/code.ips exists: SaltySD cannot boot without
+// it. Self-heals by copying a code.ips from the active folder or any repo mod
+// (the user's mod folders each carry one). Returns true if the loader exists.
+static bool ensureSaltyLoader(const GameProfile &gp)
+{
+    if (!isSalty(gp)) return true;
+
+    const std::string loaderDir = lumaPath(gp);
+    const std::string loader    = loaderDir + "/code.ips";
+    if (fileExists(loader)) return true;
+
+    std::vector<std::string> candidates;
+    candidates.push_back(repoPath(gp) + "/code.ips");   // pristine copy at repo root
+    candidates.push_back(std::string(SALTY_ACTIVE) + "/code.ips");
+    if (DIR *dp = opendir(repoPath(gp).c_str())) {
+        struct dirent *ent;
+        while ((ent = readdir(dp)) != NULL) {
+            if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
+            candidates.push_back(repoPath(gp) + "/" + ent->d_name + "/code.ips");
+        }
+        closedir(dp);
+    }
+
+    for (const std::string &c : candidates) {
+        if (!fileExists(c)) continue;
+        mkdirs(loaderDir);
+        if (copyFile(c, loader)) return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// SaltySD layout adaptation
+// ---------------------------------------------------------------------------
+// Mods are distributed (and stored in the repo) with their game data inside a
+// romfs/ subfolder, but SaltySD reads data folders (animcmd/, model/, ...)
+// DIRECTLY from saltysd/smash. So the active copy must be unwrapped, and
+// re-wrapped when it returns to the repo. Marker files (modname.txt etc.)
+// stay at the folder root in both layouts.
+
+// Move every child of src into dst (created if needed). Names are collected
+// before any rename so the directory is not mutated mid-iteration. Returns
+// true only if every entry moved.
+static bool moveChildren(const std::string &src, const std::string &dst)
+{
+    std::vector<std::string> names;
+    DIR *dp = opendir(src.c_str());
+    if (!dp) return false;
+    struct dirent *ent;
+    while ((ent = readdir(dp)) != NULL) {
+        if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
+        names.push_back(ent->d_name);
+    }
+    closedir(dp);
+
+    mkdirs(dst);
+    bool ok = true;
+    for (const std::string &n : names)
+        if (rename((src + "/" + n).c_str(), (dst + "/" + n).c_str()) != 0)
+            ok = false;
+    return ok;
+}
+
+// Active layout: hoist <folder>/romfs/* up into <folder>/ and drop the shell.
+static void saltyUnwrap(const std::string &folder)
+{
+    const std::string wrap = folder + "/romfs";
+    if (!isDir(wrap)) return;
+    if (moveChildren(wrap, folder)) rmdir(wrap.c_str());
+}
+
+// Repo layout: tuck every data DIRECTORY back inside <folder>/romfs/.
+// Files (markers, code.ips, readme txts) stay at the root.
+static void saltyRewrap(const std::string &folder)
+{
+    std::vector<std::string> dirs;
+    DIR *dp = opendir(folder.c_str());
+    if (!dp) return;
+    struct dirent *ent;
+    while ((ent = readdir(dp)) != NULL) {
+        if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
+        if (!strcmp(ent->d_name, "romfs")) continue;
+        if (isDir(folder + "/" + ent->d_name)) dirs.push_back(ent->d_name);
+    }
+    closedir(dp);
+    if (dirs.empty()) return;
+
+    const std::string wrap = folder + "/romfs";
+    mkdirs(wrap);
+    for (const std::string &n : dirs)
+        rename((folder + "/" + n).c_str(), (wrap + "/" + n).c_str());
+}
+
+// ---------------------------------------------------------------------------
+// Game name resolution
+// ---------------------------------------------------------------------------
+
+// Diagnostics for the SMDH lookup: how many titles resolved, and the last
+// error seen. Surfaced in the UI when nothing resolves, so a permission or
+// parameter problem shows its exact code instead of failing silently.
+static int    g_smdhHits   = 0;
+static Result g_smdhLastRc = 0;
+
+// Boot-time trace of every SMDH attempt, flushed to LOOKUP_LOG so failures
+// can be diagnosed off-device (fetch the file over ftpd).
+static std::string g_smdhLog;
+static const char *LOOKUP_LOG = "sdmc:/3ds/3dsmods/namelookup.log";
+
+static void smdhLogf(const char *fmt, ...)
+{
+    char buf[128];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (g_smdhLog.size() < 16384) g_smdhLog += buf;
+}
+
+// ---------------------------------------------------------------------------
+// Game icon cache: 48x48 SMDH icons uploaded once as GPU textures, keyed by
+// Title ID. SMDH stores the icon in the GPU's native tiled RGB565 layout, so
+// tile rows copy straight into a 64x64 texture (textures need pow2 sides).
+// ---------------------------------------------------------------------------
+static std::vector<std::pair<std::string, C2D_Image>> g_gameIcons;
+
+static const C2D_Image *gameIcon(const std::string &titleId)
+{
+    for (const auto &e : g_gameIcons)
+        if (e.first == titleId) return &e.second;
+    return NULL;
+}
+
+static void cacheGameIcon(const std::string &titleId, const u16 *px)
+{
+    if (gameIcon(titleId)) return;
+
+    C3D_Tex *tex = (C3D_Tex *)malloc(sizeof(C3D_Tex));
+    if (!tex) return;
+    if (!C3D_TexInit(tex, 64, 64, GPU_RGB565)) { free(tex); return; }
+
+    // 48x48 = 6 rows of 6 8x8 tiles (128 bytes each); a 64-wide row holds 8.
+    u16 *dst = (u16 *)tex->data;
+    for (int ty = 0; ty < 6; ++ty)
+        memcpy(dst + ty * 64 * 8, px + ty * 48 * 8, 48 * 8 * 2);
+    C3D_TexSetFilter(tex, GPU_LINEAR, GPU_LINEAR);
+
+    static const Tex3DS_SubTexture sub = { 48, 48, 0.0f, 1.0f, 0.75f, 0.25f };
+    const C2D_Image img = { tex, &sub };
+    g_gameIcons.push_back(std::make_pair(titleId, img));
+}
+
+// Read a title's real name from its installed SMDH (icon) metadata, the same
+// way FBI does: open the "icon" file of the title's content archive directly.
+// Tries SD, then NAND (system titles), then the game card. "" if not found.
+// A successful read also feeds the game-icon cache.
+static std::string smdhGameName(const std::string &titleIdHex)
+{
+    const u64 tid = strtoull(titleIdHex.c_str(), NULL, 16);
+    if (tid == 0) return "";
+
+    // Full SMDH (0x36C0): title blocks for the name plus the 48x48 icon.
+    // static: FS rejects IPC read buffers on the app stack with
+    // 0xE0C046F9 (InvalidArgument); .bss memory maps fine (FBI uses heap).
+    static struct {
+        u32 magic;             // 'SMDH'
+        u16 version, reserved;
+        struct { u16 shortDesc[0x40]; u16 longDesc[0x80]; u16 publisher[0x40]; } t[16];
+        u8  settings[0x30];
+        u8  reserved2[0x8];
+        u8  smallIcon[0x480];  // 24x24 RGB565 (unused)
+        u16 largeIcon[48*48];  // 48x48 RGB565, already GPU-tiled
+    } smdh;
+
+    static const FS_MediaType MEDIA[3] = { MEDIATYPE_SD, MEDIATYPE_NAND,
+                                           MEDIATYPE_GAME_CARD };
+    for (int m = 0; m < 3; ++m) {
+        u32 archPath[4] = { (u32)(tid & 0xFFFFFFFF), (u32)(tid >> 32),
+                            (u32)MEDIA[m], 0 };
+        u32 filePath[5] = { 0, 0, 2, 0x6E6F6369 /* "icon" */, 0 };
+        FS_Path aPath = { PATH_BINARY, sizeof(archPath), archPath };
+        FS_Path fPath = { PATH_BINARY, sizeof(filePath), filePath };
+
+        Handle f;
+        Result rc = FSUSER_OpenFileDirectly(&f, ARCHIVE_SAVEDATA_AND_CONTENT,
+                                            aPath, fPath, FS_OPEN_READ, 0);
+        if (R_FAILED(rc)) {
+            g_smdhLastRc = rc;
+            smdhLogf("%s m%d open rc=%08lX\n", titleIdHex.c_str(),
+                     (int)MEDIA[m], (unsigned long)rc);
+            continue;
+        }
+
+        u32 read = 0;
+        rc = FSFILE_Read(f, &read, 0, &smdh, sizeof(smdh));
+        FSFILE_Close(f);   // also closes the handle; no extra svcCloseHandle
+        if (R_FAILED(rc) || read < sizeof(smdh) || smdh.magic != 0x48444D53) {
+            if (R_FAILED(rc)) g_smdhLastRc = rc;
+            smdhLogf("%s m%d read rc=%08lX got=%lu magic=%08lX\n",
+                     titleIdHex.c_str(), (int)MEDIA[m], (unsigned long)rc,
+                     (unsigned long)read, (unsigned long)smdh.magic);
+            continue;
+        }
+        smdhLogf("%s m%d OK\n", titleIdHex.c_str(), (int)MEDIA[m]);
+        cacheGameIcon(titleIdHex, smdh.largeIcon);
+
+        // Prefer English (block 1), fall back to Japanese (block 0).
+        for (int lang = 1; lang >= 0; --lang) {
+            char out[0x40 * 3 + 1] = {0};
+            ssize_t n = utf16_to_utf8((u8 *)out, smdh.t[lang].shortDesc,
+                                      sizeof(out) - 1);
+            if (n <= 0) continue;
+            out[n] = 0;
+            std::string s(out);
+            // SMDH short titles are sometimes two lines; keep the first.
+            size_t nl = s.find('\n');
+            if (nl != std::string::npos) s.erase(nl);
+            rtrim(s);
+            if (!s.empty()) { ++g_smdhHits; return utf8Sanitize(s); }
+        }
+    }
+    return "";
+}
+
+// Offline fallback table lookup. "" if unlisted.
+static std::string gameNameFromTable(const std::string &id)
+{
+    for (const NamedTitle &t : TITLE_NAMES)
+        if (iequals(id, t.id)) return t.name;
+    return "";
+}
+
+// Last-resort label built from the Title ID's category, so leftover patch
+// folders for uninstalled/system titles read as something meaningful instead
+// of 16 raw hex digits. The unique-id half is kept for identification.
+static std::string categoryName(const std::string &id)
+{
+    if (id.size() != 16) return id;
+    const std::string hi = id.substr(0, 8), lo = id.substr(8);
+    const char *kind = NULL;
+    if      (iequals(hi, "00040010")) kind = "System app";
+    else if (iequals(hi, "00040030")) kind = "System applet";
+    else if (iequals(hi, "00040130")) kind = "System module";
+    else if (iequals(hi, "0004000E")) kind = "Game update";
+    else if (iequals(hi, "0004008C")) kind = "DLC";
+    else if (iequals(hi, "00040000")) kind = "Uninstalled game";
+    if (!kind) return id;
+    return std::string(kind) + " " + lo;
+}
+
+// Resolve a game's display name: gamename.txt (user override), then the
+// installed title's SMDH, then the offline table, then the raw Title ID.
+static std::string readGameName(const GameProfile &gp)
+{
+    std::string n = readFirstLine(activePath(gp) + "/" + GAMENAME_FILE);
+    if (n.empty()) n = readFirstLine(repoPath(gp) + "/" + GAMENAME_FILE);
+    if (!n.empty()) return utf8Sanitize(n);
+
+    n = smdhGameName(gp.titleId);
+    if (!n.empty()) return n;
+
+    n = gameNameFromTable(gp.titleId);
+    return n.empty() ? categoryName(gp.titleId) : n;
+}
+
+// ---------------------------------------------------------------------------
+// Legacy-location scan, shared by the mod list and Tidy so they always agree.
+// Collects, for this game:
+//   - luma/titles/<TitleID>_<mod> and luma/titles/Disabled<TitleID>
+//   - the bare luma folder itself, when it holds a full legacy mod for a
+//     SaltySD title (romfs inside) rather than just the loader
+//   - ModMoon slots: 3ds/ModMoon/<TitleID>/<any folder>
+//   - stray saltysd/<Slot_N> folders (SaltySD titles only)
+// ---------------------------------------------------------------------------
+static std::vector<LooseItem> collectLoose(const GameProfile &gp)
+{
+    std::vector<LooseItem> items;
+
+    // Loose folders in luma/titles.
+    if (DIR *lp = opendir(LUMA_TITLES)) {
+        const std::string pfx = gp.titleId + "_";
+        const std::string dis = "Disabled" + gp.titleId;
+        struct dirent *ent;
+        while ((ent = readdir(lp)) != NULL) {
+            const std::string name = ent->d_name;
+            std::string fb;
+            if (istartsWith(name, pfx))      fb = name.substr(pfx.size());
+            else if (iequals(name, dis))     fb = FALLBACK_NAME;
+            else continue;
+            const std::string full = std::string(LUMA_TITLES) + "/" + name;
+            if (!isDir(full)) continue;
+            items.push_back({ full, fb });
+        }
+        closedir(lp);
+    }
+
+    // For SaltySD titles the bare luma folder is the loader home, not the
+    // active mod. If a full legacy mod is parked there (it has a romfs/), it
+    // is invisible to the game - offer it as loose so Tidy can rescue it.
+    if (isSalty(gp) && isDir(lumaPath(gp) + "/romfs"))
+        items.push_back({ lumaPath(gp), "Legacy active" });
+
+    // ModMoon slots for this title.
+    const std::string mm = modmoonPath(gp);
+    if (DIR *mp = opendir(mm.c_str())) {
+        struct dirent *ent;
+        while ((ent = readdir(mp)) != NULL) {
+            if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
+            const std::string full = mm + "/" + ent->d_name;
+            if (!isDir(full)) continue;
+            items.push_back({ full, ent->d_name });
+        }
+        closedir(mp);
+    }
+
+    // Stray slot folders left directly in saltysd/ by old ModMoon versions.
+    if (isSalty(gp)) {
+        if (DIR *sp = opendir(SALTY_PARENT)) {
+            struct dirent *ent;
+            while ((ent = readdir(sp)) != NULL) {
+                const std::string name = ent->d_name;
+                if (!istartsWith(name, "Slot_")) continue;
+                const std::string full = std::string(SALTY_PARENT) + "/" + name;
+                if (!isDir(full)) continue;
+                items.push_back({ full, name });
+            }
+            closedir(sp);
+        }
+    }
+
+    return items;
+}
+
+// ---------------------------------------------------------------------------
+// Collect every mod for a game: the active folder (if any), each stored mod
+// in the repo, and legacy loose folders. Active sorts first.
+// ---------------------------------------------------------------------------
+static std::vector<ModEntry> scanMods(const GameProfile &gp)
+{
+    std::vector<ModEntry> mods;
+
+    // 1. The currently active mod, if present (an empty folder is not one).
+    const std::string ap = activePath(gp);
+    if (dirNonEmpty(ap) && !(isSalty(gp) && ap == lumaPath(gp))) {
+        ModEntry e;
+        e.path    = ap;
+        e.active  = true;
+        e.loose   = false;
+        e.display = modDisplayName(ap, "(unnamed)");
+        mods.push_back(e);
+    }
+
+    // 2. Stored mods in the repo.
+    const std::string rp = repoPath(gp);
+    if (DIR *dp = opendir(rp.c_str())) {
+        struct dirent *ent;
+        while ((ent = readdir(dp)) != NULL) {
+            if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
+            const std::string full = rp + "/" + ent->d_name;
+            if (!isDir(full)) continue;
+            ModEntry e;
+            e.path    = full;
+            e.active  = false;
+            e.loose   = false;
+            e.display = modDisplayName(full, ent->d_name);
+            mods.push_back(e);
+        }
+        closedir(dp);
+    }
+
+    // 3. Legacy loose folders (luma/titles, ModMoon, stray saltysd slots).
+    for (const LooseItem &li : collectLoose(gp)) {
+        ModEntry e;
+        e.path    = li.path;
+        e.active  = false;
+        e.loose   = true;
+        e.display = modDisplayName(li.path, li.fallback);
+        mods.push_back(e);
+    }
+
+    std::sort(mods.begin(), mods.end(), [](const ModEntry &a, const ModEntry &b) {
+        if (a.active != b.active) return a.active;   // active first
+        return a.display < b.display;                 // then alphabetical
+    });
+    return mods;
+}
+
+// ---------------------------------------------------------------------------
+// Discover one GameProfile per unique Title ID found under luma/titles, the
+// mod repo, or the ModMoon repo. A game stays discoverable whether it has an
+// active mod, stored mods, or only legacy folders.
+// ---------------------------------------------------------------------------
+static std::vector<GameProfile> discoverProfiles()
+{
+    std::vector<std::string> ids;
+    auto addId = [&ids](const std::string &id) {
+        auto dup = std::find_if(ids.begin(), ids.end(),
+                                [&id](const std::string &e) { return iequals(e, id); });
+        if (dup == ids.end()) ids.push_back(id);
+    };
+
+    if (DIR *dp = opendir(LUMA_TITLES)) {
+        struct dirent *ent;
+        while ((ent = readdir(dp)) != NULL) {
+            std::string id = titleIdOf(ent->d_name);
+            if (id.empty()) continue;
+            // Empty leftover folders (browserhax/cheat-tool debris) are not
+            // games worth listing; repo folders still register below.
+            if (!dirNonEmpty(std::string(LUMA_TITLES) + "/" + ent->d_name)) continue;
+            addId(id);
+        }
+        closedir(dp);
+    }
+
+    for (const char *root : { MOD_REPO, MODMOON_REPO }) {
+        if (DIR *rp = opendir(root)) {
+            struct dirent *ent;
+            while ((ent = readdir(rp)) != NULL) {
+                if (!isTitleId(ent->d_name)) continue;
+                if (!isDir(std::string(root) + "/" + ent->d_name)) continue;
+                addId(ent->d_name);
+            }
+            closedir(rp);
+        }
+    }
+
+    std::vector<GameProfile> profiles;
+    for (const std::string &id : ids) {
+        GameProfile gp;
+        gp.titleId   = id;
+        gp.title     = readGameName(gp);
+        gp.modCount  = 0;
+        gp.hasActive = false;
+        profiles.push_back(gp);
+    }
+
+    // Case-insensitive sort so lowercase names don't sink below uppercase ones.
+    std::sort(profiles.begin(), profiles.end(),
+              [](const GameProfile &a, const GameProfile &b) {
+                  const size_t n = std::min(a.title.size(), b.title.size());
+                  for (size_t i = 0; i < n; ++i) {
+                      int ca = tolower((unsigned char)a.title[i]);
+                      int cb = tolower((unsigned char)b.title[i]);
+                      if (ca != cb) return ca < cb;
+                  }
+                  return a.title.size() < b.title.size();
+              });
+    return profiles;
+}
+
+// Recompute one game's mod count / active flag (shown in the game list).
+static void refreshStats(GameProfile &gp)
+{
+    std::vector<ModEntry> m = scanMods(gp);
+    gp.modCount  = (int)m.size();
+    gp.hasActive = !m.empty() && m.front().active;  // active sorts first
+}
+
+// Full recompute; every scanMods re-lists luma/titles + ModMoon + saltysd,
+// so this costs dozens of SD round-trips - boot only. Interactive paths
+// refresh just the game that changed.
+static void refreshStats(std::vector<GameProfile> &profiles)
+{
+    for (GameProfile &gp : profiles) refreshStats(gp);
+}
+
+// ---------------------------------------------------------------------------
+// Activate a stored mod. Two metadata-only moves, no deletion:
+//   1. (if a mod is active) move it into the repo under its own name.
+//   2. move the selected folder into the active location.
+// On failure, step 1 is rolled back. For SaltySD titles the loader is
+// re-verified afterwards (a legacy folder move may have carried it away).
+// ---------------------------------------------------------------------------
+static bool activateMod(const GameProfile &gp, const ModEntry &target,
+                        Status *st)
+{
+    if (target.active) {
+        *st = { "That mod is already active.", SK_WARN };
+        return false;
+    }
+
+    const std::string ap = activePath(gp);
+    mkdirs(repoPath(gp));
+    if (isSalty(gp)) mkdirs(SALTY_PARENT);   // saltysd/ may have been wiped
+
+    std::string stashed;                 // where the old active went (rollback)
+    const bool hasActive = isDir(ap);
+    if (hasActive) {
+        std::string name   = sanitizeName(modDisplayName(ap, FALLBACK_NAME));
+        std::string folder = uniqueRepoFolder(gp, name);
+        stashed = repoModPath(gp, folder);
+        if (rename(ap.c_str(), stashed.c_str()) != 0) {
+            *st = { "Could not stash the active mod.", SK_ERR };
+            return false;
+        }
+    }
+
+    if (rename(target.path.c_str(), ap.c_str()) != 0) {
+        if (hasActive) rename(stashed.c_str(), ap.c_str());   // roll back
+        *st = { "Could not activate the selected mod.", SK_ERR };
+        return false;
+    }
+
+    // Layout fixups only once both renames are in (rollback stays exact).
+    if (isSalty(gp)) {
+        saltyUnwrap(ap);
+        if (hasActive) saltyRewrap(stashed);
+    }
+
+    g_saltyLoaderOk = ensureSaltyLoader(gp);
+    *st = { "Activated: " + modDisplayName(ap, "mod"), SK_OK };
+    if (!g_saltyLoaderOk)
+        *st = { "Activated, but SaltySD code.ips is missing!", SK_WARN };
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Disable the active mod: move it back into the repo so the game boots vanilla.
+// (For SaltySD titles the loader stays in luma/titles; with saltysd/smash gone
+// the patch simply finds no replacement files.)
+// ---------------------------------------------------------------------------
+static bool disableMod(const GameProfile &gp, Status *st)
+{
+    const std::string ap = activePath(gp);
+    if (!isDir(ap) || (isSalty(gp) && ap == lumaPath(gp))) {
+        *st = { "No active mod - already vanilla.", SK_WARN };
+        return false;
+    }
+
+    mkdirs(repoPath(gp));
+    std::string name   = sanitizeName(modDisplayName(ap, FALLBACK_NAME));
+    std::string folder = uniqueRepoFolder(gp, name);
+    if (rename(ap.c_str(), repoModPath(gp, folder).c_str()) != 0) {
+        *st = { "Could not disable the active mod.", SK_ERR };
+        return false;
+    }
+    if (isSalty(gp)) saltyRewrap(repoModPath(gp, folder));
+
+    g_saltyLoaderOk = ensureSaltyLoader(gp);
+    *st = { "Mods disabled - game now runs vanilla.", SK_OK };
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Tidy: migrate every legacy folder for this game into the repo (loose luma
+// folders, ModMoon slots, stray saltysd slots). Collects paths first, then
+// renames. For SaltySD titles the loader is restored afterwards if the move
+// carried it away inside a legacy folder.
+// ---------------------------------------------------------------------------
+static bool tidyLooseMods(const GameProfile &gp, Status *st)
+{
+    std::vector<LooseItem> loose = collectLoose(gp);
+
+    if (loose.empty()) {
+        *st = { "Nothing to tidy - no legacy folders.", SK_WARN };
+        return false;
+    }
+
+    mkdirs(repoPath(gp));
+    int moved = 0, failed = 0;
+
+    for (const LooseItem &li : loose) {
+        std::string disp   = sanitizeName(modDisplayName(li.path, li.fallback));
+        std::string folder = uniqueRepoFolder(gp, disp);
+        if (rename(li.path.c_str(), repoModPath(gp, folder).c_str()) == 0) {
+            if (isSalty(gp)) saltyRewrap(repoModPath(gp, folder));
+            ++moved;
+        } else {
+            ++failed;
+        }
+    }
+
+    g_saltyLoaderOk = ensureSaltyLoader(gp);
+
+    if (failed) {
+        *st = { "Tidied " + std::to_string(moved) + ", " +
+                std::to_string(failed) + " failed.", SK_ERR };
+        return false;
+    }
+    *st = { "Tidied " + std::to_string(moved) + " mod(s) into the repo.", SK_OK };
+    if (!g_saltyLoaderOk)
+        *st = { "Tidied " + std::to_string(moved) +
+                ", but SaltySD code.ips is missing!", SK_WARN };
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Settings (theme persistence)
+// ---------------------------------------------------------------------------
+static void loadSettings()
+{
+    std::string line = readFirstLine(SETTINGS_TXT);
+    if (istartsWith(line, "theme=")) {
+        std::string name = line.substr(6);
+        for (int i = 0; i < NUM_THEMES; ++i)
+            if (iequals(name, THEMES[i].name)) { g_themeIdx = i; break; }
+    }
+}
+
+static void saveSettings()
+{
+    mkdirs(MOD_REPO);
+    FILE *f = fopen(SETTINGS_TXT, "w");
+    if (!f) return;
+    fprintf(f, "theme=%s\n", T.name);
+    fclose(f);
+}
+
+// ===========================================================================
+// Rendering primitives (citro2d)
+// ===========================================================================
+
+static C2D_TextBuf g_textBuf;   // dynamic glyph buffer, cleared every frame
+
+// Replace a color's alpha channel.
+static u32 withAlpha(u32 c, u8 a)
+{
+    return (c & 0x00FFFFFF) | ((u32)a << 24);
+}
+
+// Blend between two colors (component-wise, including alpha).
+static u32 lerpColor(u32 a, u32 b, float t)
+{
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    const u8 ar = a & 0xFF, ag = (a >> 8) & 0xFF, ab = (a >> 16) & 0xFF, aa = a >> 24;
+    const u8 br = b & 0xFF, bg = (b >> 8) & 0xFF, bb = (b >> 16) & 0xFF, ba = b >> 24;
+    return C2D_Color32((u8)(ar + (br - ar) * t), (u8)(ag + (bg - ag) * t),
+                       (u8)(ab + (bb - ab) * t), (u8)(aa + (ba - aa) * t));
+}
+
+// Axis-aligned gradients.
+static void vGrad(float x, float y, float w, float h, u32 top, u32 bottom)
+{
+    C2D_DrawRectangle(x, y, 0.5f, w, h, top, top, bottom, bottom);
+}
+static void hGrad(float x, float y, float w, float h, u32 left, u32 right)
+{
+    C2D_DrawRectangle(x, y, 0.5f, w, h, left, right, left, right);
+}
+
+// Measure a string's rendered width at the given scale.
+static float textWidth(const std::string &s, float scale)
+{
+    if (s.empty()) return 0.0f;
+    C2D_Text t;
+    C2D_TextParse(&t, g_textBuf, s.c_str());
+    float w, h;
+    C2D_TextGetDimensions(&t, scale, scale, &w, &h);
+    return w;
+}
+
+// Draw text with its top-left corner at (x, y).
+static void drawText(float x, float y, float scale, u32 color, const std::string &s)
+{
+    if (s.empty()) return;
+    C2D_Text t;
+    C2D_TextParse(&t, g_textBuf, s.c_str());
+    C2D_TextOptimize(&t);
+    C2D_DrawText(&t, C2D_WithColor, x, y, 0.5f, scale, scale, color);
+}
+
+// Draw text right-aligned against `right`.
+static void drawTextRight(float right, float y, float scale, u32 color,
+                          const std::string &s)
+{
+    drawText(right - textWidth(s, scale), y, scale, color, s);
+}
+
+// Draw text horizontally centred on `cx`.
+static void drawTextCenter(float cx, float y, float scale, u32 color,
+                           const std::string &s)
+{
+    drawText(cx - textWidth(s, scale) / 2.0f, y, scale, color, s);
+}
+
+// Truncate a string (appending an ellipsis) until it fits in `maxW` pixels.
+static std::string fitText(const std::string &s, float scale, float maxW)
+{
+    if (textWidth(s, scale) <= maxW) return s;
+
+    static const std::string ELL = "…";
+    std::string cur = s;
+    while (!cur.empty()) {
+        // Drop one UTF-8 code point from the end.
+        size_t i = cur.size() - 1;
+        while (i > 0 && ((unsigned char)cur[i] & 0xC0) == 0x80) --i;
+        cur.erase(i);
+        if (textWidth(cur + ELL, scale) <= maxW) return cur + ELL;
+    }
+    return ELL;
+}
+
+// Filled rounded rectangle.
+static void roundRect(float x, float y, float w, float h, float r, u32 c)
+{
+    if (r > w / 2) r = w / 2;
+    if (r > h / 2) r = h / 2;
+    C2D_DrawRectSolid(x + r, y, 0.5f, w - 2 * r, h, c);
+    C2D_DrawRectSolid(x, y + r, 0.5f, w, h - 2 * r, c);
+    C2D_DrawCircleSolid(x + r,     y + r,     0.5f, r, c);
+    C2D_DrawCircleSolid(x + w - r, y + r,     0.5f, r, c);
+    C2D_DrawCircleSolid(x + r,     y + h - r, 0.5f, r, c);
+    C2D_DrawCircleSolid(x + w - r, y + h - r, 0.5f, r, c);
+}
+
+// Small rounded badge ("pill"). Returns its width so callers can lay out
+// around it. When drawRight is true, `x` is treated as the RIGHT edge.
+static float drawPill(float x, float y, const std::string &label, float scale,
+                      u32 bg, u32 fg, bool drawRight)
+{
+    const float tw = textWidth(label, scale);
+    const float th = 30.0f * scale;
+    const float w  = tw + 12.0f;
+    const float h  = th + 4.0f;
+    const float px = drawRight ? x - w : x;
+    roundRect(px, y, w, h, h / 2.0f, bg);
+    drawText(px + 6.0f, y + 2.0f, scale, fg, label);
+    return w;
+}
+
+// ---------------------------------------------------------------------------
+// Animated background: vertical dusk gradient + two layers of drifting glow
+// orbs. Particle hues follow the current theme.
+// ---------------------------------------------------------------------------
+struct Particle {
+    float x, y, r, speed, phase;
+    int   hue;      // 0..3, resolved against the theme each frame
+    u8    alpha;
+};
+
+static u32 particleColor(const Particle &p)
+{
+    switch (p.hue) {
+        case 0:  return withAlpha(T.accent,    p.alpha);
+        case 1:  return withAlpha(T.info,      p.alpha);
+        case 2:  return withAlpha(T.secondary, p.alpha);
+        default: return withAlpha(CLR_GREEN,   p.alpha);
+    }
+}
+
+static std::vector<Particle> makeParticles(int bigCount, int smallCount, float w)
+{
+    std::vector<Particle> ps;
+    for (int i = 0; i < bigCount + smallCount; ++i) {
+        const bool big = i < bigCount;
+        Particle p;
+        p.x     = (float)(rand() % (int)w);
+        p.y     = (float)(rand() % 240);
+        p.r     = big ? 28.0f + rand() % 34 : 1.5f + (rand() % 30) / 10.0f;
+        p.speed = big ? 0.05f + (rand() % 10) / 100.0f
+                      : 0.15f + (rand() % 25) / 100.0f;
+        p.phase = (float)(rand() % 628) / 100.0f;
+        p.hue   = rand() % 4;
+        p.alpha = big ? 10 : 26;
+        ps.push_back(p);
+    }
+    return ps;
+}
+
+static void drawBackground(std::vector<Particle> &ps, float w)
+{
+    vGrad(0, 0, w, 240, T.bgTop, T.bgBot);
+    for (Particle &p : ps) {
+        p.y -= p.speed;
+        if (p.y < -p.r - 10) {                      // wrap to the bottom
+            p.y = 250 + p.r;
+            p.x = (float)(rand() % (int)w);
+        }
+        const float wob = sinf(g_t * 0.6f + p.phase) * (p.r > 10 ? 14.0f : 6.0f);
+        const float px = p.x + wob;
+        if (p.r > 10) {
+            // Aurora blob: three concentric fades approximate a soft glow.
+            const u32 base = particleColor(p) & 0x00FFFFFF;
+            C2D_DrawCircleSolid(px, p.y, 0.5f, p.r * 1.8f, withAlpha(base, 4));
+            C2D_DrawCircleSolid(px, p.y, 0.5f, p.r * 1.3f, withAlpha(base, 7));
+            C2D_DrawCircleSolid(px, p.y, 0.5f, p.r,        withAlpha(base, 11));
+        } else {
+            C2D_DrawCircleSolid(px, p.y, 0.5f, p.r, particleColor(p));
+        }
+    }
+}
+
+// Animated two-tone accent strip (used under headers).
+static void drawAccentStrip(float x, float y, float w, float h)
+{
+    const u32 l = lerpColor(T.accent, T.secondary, 0.5f + 0.5f * sinf(g_t * 0.7f));
+    const u32 r = lerpColor(T.info,   T.accent,    0.5f + 0.5f * sinf(g_t * 0.7f + 2.1f));
+    hGrad(x, y, w, h, l, r);
+}
+
+// Card panel: drop shadow + soft animated border glow.
+static void drawCard(float x, float y, float w, float h)
+{
+    const float pulse = 0.5f + 0.5f * sinf(g_t * 1.6f);
+    const u32 glow = withAlpha(lerpColor(T.accent, T.secondary, pulse), 110);
+    roundRect(x + 2.5f, y + 3.5f, w, h, 10.0f, C2D_Color32(0, 0, 0, 90));
+    roundRect(x - 1.5f, y - 1.5f, w + 3.0f, h + 3.0f, 11.5f, glow);
+    roundRect(x, y, w, h, 10.0f, T.panel);
+}
+
+// ---------------------------------------------------------------------------
+// Motion. Everything animates by interpolating draw coordinates per frame -
+// the same batched quads render either way, so 60 fps costs nothing extra.
+// ---------------------------------------------------------------------------
+static float g_screenAnim = 1.0f;   // 0 -> 1 after each screen change
+static float g_selAnim    = 0.0f;   // eased highlight slot in bottom lists
+static bool  g_selSnap    = true;   // teleport the highlight next frame
+static float g_statusAge  = 999.0f; // seconds since the toast text changed
+
+static float easeOutCubic(float t)
+{
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    const float u = 1.0f - t;
+    return 1.0f - u * u * u;
+}
+
+// Slide-in offset for list rows, staggered top to bottom.
+static float rowSlide(int slot)
+{
+    return (1.0f - easeOutCubic(g_screenAnim * 1.35f - slot * 0.055f)) * 46.0f;
+}
+
+// Ease the shared selection highlight toward the given viewport slot.
+static void trackSelection(int slot)
+{
+    if (g_selSnap) { g_selAnim = (float)slot; g_selSnap = false; }
+    g_selAnim += ((float)slot - g_selAnim) * 0.38f;
+}
+
+// ===========================================================================
+// Screens
+// ===========================================================================
+
+static void drawTopHeader(const char *screenTitle)
+{
+    hGrad(0, 0, 400, 32, T.panel, withAlpha(T.panel2, 0xEE));
+    drawAccentStrip(0, 32, 400, 2);
+    drawText(12, 6, 0.6f, CLR_WHITE, screenTitle);
+
+    // osGetTime: ms since 1900-01-01 in local time -> wall clock.
+    const u32 daySec = (u32)((osGetTime() / 1000) % 86400);
+    char clk[8];
+    snprintf(clk, sizeof(clk), "%02u:%02u",
+             (unsigned)(daySec / 3600), (unsigned)((daySec / 60) % 60));
+    drawTextCenter(200, 11, 0.42f, T.muted, clk);
+
+    drawTextRight(388, 11, 0.42f, T.muted, "3DS Mod Manager v3.0");
+}
+
+static void drawTopFooter()
+{
+    C2D_DrawRectSolid(0, 222, 0.5f, 400, 18, T.panel);
+    drawTextCenter(200, 225, 0.4f, T.muted,
+                   "stored: 3ds/3dsmods      smash: saltysd/smash");
+}
+
+// Top screen while browsing the game list: live details of the highlighted game.
+static void drawTopGames(const std::vector<GameProfile> &profiles, int cursor)
+{
+    drawTopHeader("Games");
+
+    if (profiles.empty()) {
+        drawCard(20, 60, 360, 120);
+        drawTextCenter(200, 95, 0.55f, CLR_YELLOW, "No games found");
+        drawTextCenter(200, 125, 0.42f, T.muted,
+                       "Add mods to 3ds/3dsmods/<TitleID>/");
+        drawTopFooter();
+        return;
+    }
+
+    const GameProfile &gp = profiles[cursor];
+
+    drawCard(20, 52, 360, 132);
+    const C2D_Image *ic = gameIcon(gp.titleId);
+    float tx = 36;
+    if (ic) {
+        roundRect(33, 59, 54, 54, 6, T.panel2);
+        C2D_DrawImageAt(*ic, 36, 62, 0.5f, NULL, 1.0f, 1.0f);
+        tx = 100;
+    }
+    drawText(tx, 66, 0.7f, CLR_WHITE, fitText(gp.title, 0.7f, 364 - tx));
+    drawText(tx, 96, 0.45f, T.muted, "Title ID");
+    drawText(tx + 74, 96, 0.45f, T.secondary, gp.titleId);
+
+    float x = 36;
+    if (gp.hasActive)
+        x += drawPill(36, 122, "MODDED", 0.42f, CLR_GREEN, CLR_DARK, false) + 10;
+    else
+        x += drawPill(36, 122, "VANILLA", 0.42f, T.panel2, T.text, false) + 10;
+    if (isSalty(gp))
+        x += drawPill(x, 122, "SaltySD", 0.42f, T.info, CLR_DARK, false) + 10;
+    drawText(x, 124, 0.45f, T.info,
+             std::to_string(gp.modCount) + (gp.modCount == 1 ? " mod" : " mods"));
+
+    drawText(36, 156, 0.42f, T.muted, "Press " G_A " to manage this game's mods");
+
+    drawTopFooter();
+}
+
+// Top screen inside a game's mod menu.
+static void drawTopMods(const GameProfile &gp, const std::vector<ModEntry> &mods)
+{
+    drawTopHeader("Mods");
+
+    std::string activeName;
+    int looseCount = 0;
+    for (const ModEntry &m : mods) {
+        if (m.active) activeName = m.display;
+        if (m.loose)  ++looseCount;
+    }
+
+    drawCard(20, 52, 360, 126);
+    const C2D_Image *ic = gameIcon(gp.titleId);
+    float tx = 36;
+    if (ic) {
+        const float s = 40.0f / 48.0f;
+        roundRect(33, 59, 46, 46, 5, T.panel2);
+        C2D_DrawImageAt(*ic, 36, 62, 0.5f, NULL, s, s);
+        tx = 90;
+    }
+    drawText(tx, 64, 0.62f, CLR_WHITE, fitText(gp.title, 0.62f, 364 - tx));
+    drawText(tx, 92, 0.42f, T.muted, "Title ID");
+    drawText(tx + 68, 92, 0.42f, T.secondary, gp.titleId);
+    if (isSalty(gp))   // right-aligned at the card edge, clear of the ID text
+        drawPill(364, 88, "SaltySD", 0.4f, T.info, CLR_DARK, true);
+
+    drawText(36, 118, 0.45f, T.muted, "Active");
+    if (!activeName.empty())
+        drawPill(96, 115, fitText(activeName, 0.42f, 240), 0.42f, CLR_GREEN, CLR_DARK, false);
+    else
+        drawPill(96, 115, "none - vanilla", 0.42f, T.panel2, T.text, false);
+
+    drawText(36, 150, 0.45f, T.muted, "Library");
+    drawText(104, 150, 0.45f, T.info,
+             std::to_string((int)mods.size()) +
+             (mods.size() == 1 ? " mod" : " mods"));
+
+    if (isSalty(gp) && !g_saltyLoaderOk) {
+        roundRect(20, 188, 360, 26, 7, CLR_RED);
+        drawTextCenter(200, 193, 0.42f, CLR_DARK,
+                       "SaltySD loader missing: luma/titles/.../code.ips");
+    } else if (looseCount > 0) {
+        roundRect(20, 188, 360, 26, 7, CLR_ORANGE);
+        drawTextCenter(200, 193, 0.42f, CLR_DARK,
+                       std::to_string(looseCount) +
+                       " legacy folder(s) found - press " G_Y " to tidy");
+    }
+
+    drawTopFooter();
+}
+
+// Top screen in the theme picker.
+static void drawTopThemes()
+{
+    drawTopHeader("Themes");
+    drawCard(20, 60, 360, 110);
+    drawText(36, 74, 0.66f, CLR_WHITE, T.name);
+    drawText(36, 106, 0.45f, T.muted, "Changes apply instantly.");
+    drawText(36, 128, 0.45f, T.muted,
+             "Press " G_A " or " G_B " to keep this theme.");
+    drawTopFooter();
+}
+
+// Bottom-screen chrome: header bar with title + index, hint bar at the bottom.
+static void drawBottomChrome(const std::string &title, int cursor, int total,
+                             const std::string &hints)
+{
+    hGrad(0, 0, 320, 26, T.panel, withAlpha(T.panel2, 0xEE));
+    drawAccentStrip(0, 26, 320, 2);
+    drawText(8, 4, 0.5f, CLR_WHITE, fitText(title, 0.5f, 244));
+    if (total > 0)
+        drawPill(314, 5, std::to_string(cursor + 1) + "/" + std::to_string(total),
+                 0.36f, T.panel2, T.info, true);
+
+    drawAccentStrip(0, 215, 320, 1);
+    C2D_DrawRectSolid(0, 216, 0.5f, 320, 24, T.panel);
+    drawText(8, 221, 0.42f, T.text, hints);
+}
+
+// Scrolling viewport over `total` items: picks [start, end) so the cursor
+// stays centred once the list outgrows the window.
+static void viewport(int total, int cursor, int &start, int &end)
+{
+    start = 0;
+    if (total > LIST_ROWS) {
+        start = cursor - LIST_ROWS / 2;
+        if (start < 0) start = 0;
+        if (start > total - LIST_ROWS) start = total - LIST_ROWS;
+    }
+    end = start + LIST_ROWS;
+    if (end > total) end = total;
+}
+
+// Scrollbar along the right edge of the list area.
+static void drawScrollbar(int total, int start)
+{
+    if (total <= LIST_ROWS) return;
+    const float trackY = LIST_Y, trackH = LIST_ROWS * ROW_H;
+    roundRect(314, trackY, 4, trackH, 2, withAlpha(T.panel2, 120));
+    const float thumbH = trackH * (float)LIST_ROWS / total;
+
+    // Ease the thumb toward its target so scrolling feels fluid.
+    static float smoothY = -1.0f;
+    const float targetY = trackY + (trackH - thumbH) * (float)start /
+                          (total - LIST_ROWS);
+    if (smoothY < 0) smoothY = targetY;
+    smoothY += (targetY - smoothY) * 0.35f;
+
+    roundRect(313, smoothY - 1, 6, thumbH + 2, 3, withAlpha(T.accent, 70));
+    roundRect(314, smoothY, 4, thumbH, 2, T.accent);
+}
+
+// One list row with an optional right-aligned badge.
+static void drawListRow(int slot, const std::string &name, bool selected,
+                        const char *badge, u32 badgeBg,
+                        const C2D_Image *icon = NULL,
+                        const std::string &sub = "")
+{
+    const float y    = LIST_Y + slot * ROW_H;
+    const float x    = 4 + rowSlide(slot);
+    const float rowW = 306;
+
+    if (selected) {
+        // The highlight lives at the EASED slot so it glides between rows;
+        // the row's own content stays put and simply brightens.
+        const float hy    = LIST_Y + g_selAnim * ROW_H;
+        const float pulse = 0.5f + 0.5f * sinf(g_t * 2.4f);
+        roundRect(x + 2, hy + 4, rowW, ROW_H - 5, 8, C2D_Color32(0, 0, 0, 80));
+        roundRect(x - 1, hy + 1, rowW + 2, ROW_H - 3, 8,
+                  withAlpha(lerpColor(T.accent, T.secondary, pulse), 95));
+        roundRect(x + 1, hy + 3, rowW - 2, ROW_H - 7, 7,
+                  lerpColor(T.selL, T.selR, 0.5f + 0.5f * sinf(g_t * 0.9f)));
+        C2D_DrawRectSolid(x + 4, hy + 7, 0.5f, 3, ROW_H - 15,
+                          lerpColor(T.accent, T.info, pulse));
+    } else {
+        roundRect(x, y + 2, rowW, ROW_H - 5, 7,
+                  withAlpha(T.panel2, slot % 2 ? 46 : 70));
+    }
+
+    float badgeW = 0;
+    if (badge && badge[0])
+        badgeW = drawPill(x + rowW - 8, y + 6, badge, 0.38f, badgeBg,
+                          CLR_DARK, true) + 8;
+
+    float tx = x + 12;
+    if (icon) {
+        const float s = (ROW_H - 6) / 48.0f;   // 22px square
+        C2D_DrawImageAt(*icon, x + 8, y + 3, 0.5f, NULL, s, s);
+        tx = x + 36;
+    }
+
+    float subW = 0;
+    if (!sub.empty() && ROW_H >= 26) {
+        subW = textWidth(sub, 0.36f) + 8;
+        drawTextRight(x + rowW - 10 - badgeW, y + 8, 0.36f,
+                      selected ? withAlpha(CLR_WHITE, 0xB4) : T.muted, sub);
+    }
+
+    const float nameMax = (x + rowW - 8) - badgeW - subW - tx;
+    drawText(tx, y + 6, 0.5f, selected ? CLR_WHITE : T.text,
+             fitText(name, 0.5f, nameMax));
+}
+
+// Status toast: slides up when the text changes, lingers, then slides away.
+static void drawStatus(const Status &st)
+{
+    if (st.msg.empty()) return;
+    const float SHOW = 4.2f, IN = 0.22f, OUT = 0.3f;
+    if (g_statusAge > SHOW + OUT) return;
+
+    float yoff = 0;                                 // 0 = fully shown
+    if (g_statusAge < IN)
+        yoff = (1.0f - easeOutCubic(g_statusAge / IN)) * 20.0f;
+    else if (g_statusAge > SHOW)
+        yoff = easeOutCubic((g_statusAge - SHOW) / OUT) * 20.0f;
+
+    u32 c = T.text;
+    if      (st.kind == SK_OK)   c = CLR_GREEN;
+    else if (st.kind == SK_WARN) c = CLR_YELLOW;
+    else if (st.kind == SK_ERR)  c = CLR_RED;
+    const float y = 198 + yoff;
+    C2D_DrawRectSolid(0, y, 0.5f, 320, 18, lerpColor(T.panel2, c, 0.18f));
+    C2D_DrawRectSolid(0, y, 0.5f, 3, 18, c);
+    drawText(10, y + 3, 0.42f, c, fitText(st.msg, 0.42f, 302));
+}
+
+// Bottom screen: game list.
+static void drawBottomGames(const std::vector<GameProfile> &profiles, int cursor,
+                            const Status &st)
+{
+    drawBottomChrome("Select a game", cursor, (int)profiles.size(),
+                     G_DPAD " Move  " G_A " Open  SELECT Themes");
+
+    if (profiles.empty()) {
+        drawTextCenter(160, 100, 0.5f, T.muted, "No games found");
+        drawTextCenter(160, 125, 0.4f, T.muted, "3ds/3dsmods/<TitleID>/<mod>/");
+        return;
+    }
+
+    const int total = (int)profiles.size();
+    int start, end;
+    viewport(total, cursor, start, end);
+    trackSelection(cursor - start);
+
+    for (int i = start; i < end; ++i) {
+        const GameProfile &gp = profiles[i];
+        std::string sub;
+        if (gp.modCount > 0)
+            sub = std::to_string(gp.modCount) +
+                  (gp.modCount == 1 ? " mod" : " mods");
+        drawListRow(i - start, gp.title, i == cursor,
+                    gp.hasActive ? "ON" : "", T.info,
+                    gameIcon(gp.titleId), sub);
+    }
+
+    drawScrollbar(total, start);
+    drawStatus(st);
+}
+
+// Bottom screen: mod list for the selected game.
+static void drawBottomMods(const GameProfile &gp, const std::vector<ModEntry> &mods,
+                           int cursor, const Status &st)
+{
+    drawBottomChrome(gp.title, cursor, (int)mods.size(),
+                     G_A " Use  " G_X " Vanilla  " G_Y " Tidy  " G_B " Back");
+
+    if (mods.empty()) {
+        drawTextCenter(160, 95, 0.5f, T.muted, "No mods found");
+        drawTextCenter(160, 120, 0.4f, T.muted,
+                       "3ds/3dsmods/" + gp.titleId + "/");
+    } else {
+        const int total = (int)mods.size();
+        int start, end;
+        viewport(total, cursor, start, end);
+        trackSelection(cursor - start);
+
+        for (int i = start; i < end; ++i) {
+            const ModEntry &m = mods[i];
+            const char *badge = m.active ? "ACTIVE" : (m.loose ? "LOOSE" : "");
+            drawListRow(i - start, m.display, i == cursor,
+                        badge, m.active ? CLR_GREEN : CLR_ORANGE);
+        }
+
+        drawScrollbar(total, start);
+    }
+
+    drawStatus(st);
+}
+
+// Bottom screen: theme picker. Each row previews its palette as color dots.
+static void drawBottomThemes(int cursor)
+{
+    drawBottomChrome("Themes", cursor, NUM_THEMES,
+                     G_DPAD " Move  " G_A " Keep  " G_B " Back");
+
+    trackSelection(cursor);
+    for (int i = 0; i < NUM_THEMES; ++i) {
+        const float y = LIST_Y + i * ROW_H;
+        drawListRow(i, THEMES[i].name, i == cursor, "", 0);
+        // palette preview dots (accent / secondary / info)
+        const float cy = y + ROW_H / 2.0f;
+        C2D_DrawCircleSolid(262, cy, 0.5f, 4.5f, THEMES[i].accent);
+        C2D_DrawCircleSolid(278, cy, 0.5f, 4.5f, THEMES[i].secondary);
+        C2D_DrawCircleSolid(294, cy, 0.5f, 4.5f, THEMES[i].info);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Program entry point.
+// ---------------------------------------------------------------------------
+int main(int argc, char **argv)
+{
+    gfxInitDefault();
+    C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
+    C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
+    C2D_Prepare();
+    fontEnsureMapped();   // system shared font for all text
+
+    C3D_RenderTarget *top = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
+    C3D_RenderTarget *bot = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
+    g_textBuf = C2D_TextBufNew(8192);
+
+    srand((unsigned)svcGetSystemTick());
+    std::vector<Particle> topParticles = makeParticles(5, 18, 400);
+    std::vector<Particle> botParticles = makeParticles(4, 14, 320);
+
+    loadSettings();
+
+    std::vector<GameProfile> profiles = discoverProfiles();
+    refreshStats(profiles);
+
+    // Flush the SMDH attempt trace for off-device diagnosis.
+    if (FILE *lf = fopen(LOOKUP_LOG, "w")) {
+        fprintf(lf, "v3.0 hits=%d lastRc=%08lX\n", g_smdhHits,
+                (unsigned long)g_smdhLastRc);
+        fputs(g_smdhLog.c_str(), lf);
+        fclose(lf);
+    }
+
+    enum AppState { ST_GAMES, ST_MODS, ST_THEMES };
+    AppState state       = ST_GAMES;
+    AppState themeReturn = ST_GAMES;
+
+    int gameCursor  = 0;
+    int selected    = 0;
+    int modCursor   = 0;
+    int themeCursor = g_themeIdx;
+    std::vector<ModEntry> mods;
+    Status status = { "", SK_NEUTRAL };
+
+    // If not a single title name resolved via SMDH, surface the last FS error
+    // so the failure is diagnosable on-device (e.g. missing CIA permissions).
+    if (!profiles.empty() && g_smdhHits == 0 && g_smdhLastRc != 0) {
+        char rcbuf[16];
+        snprintf(rcbuf, sizeof(rcbuf), "%08lX", (unsigned long)g_smdhLastRc);
+        status = { std::string("Name lookup failed: 0x") + rcbuf, SK_WARN };
+    }
+
+    while (aptMainLoop()) {
+        hidScanInput();
+        const u32 kDown = hidKeysDown();         // one-shot: actions
+        const u32 kNav  = hidKeysDownRepeat();   // auto-repeats: hold to scroll
+
+        if (kDown & KEY_START)
+            break;
+
+        // ------------------------------ input ------------------------------
+        if (state == ST_THEMES) {
+            if (kNav & KEY_DOWN) themeCursor = (themeCursor + 1) % NUM_THEMES;
+            if (kNav & KEY_UP)   themeCursor = (themeCursor - 1 + NUM_THEMES) % NUM_THEMES;
+            g_themeIdx = themeCursor;   // live preview
+
+            if (kDown & (KEY_A | KEY_B | KEY_SELECT)) {
+                saveSettings();
+                state = themeReturn;
+            }
+        }
+        else if (state == ST_GAMES) {
+            const int n = (int)profiles.size();
+
+            if (n > 0 && (kNav & KEY_DOWN)) gameCursor = (gameCursor + 1) % n;
+            if (n > 0 && (kNav & KEY_UP))   gameCursor = (gameCursor - 1 + n) % n;
+
+            if (kDown & KEY_SELECT) {
+                themeReturn = ST_GAMES;
+                themeCursor = g_themeIdx;
+                state = ST_THEMES;
+            }
+            else if (n > 0 && (kDown & KEY_A)) {
+                selected  = gameCursor;
+                mods      = scanMods(profiles[selected]);
+                modCursor = 0;
+                status    = { "", SK_NEUTRAL };
+                g_saltyLoaderOk = ensureSaltyLoader(profiles[selected]);
+                state = ST_MODS;
+            }
+        }
+        else { // ST_MODS
+            const GameProfile &gp = profiles[selected];
+
+            if (kDown & KEY_B) {
+                state      = ST_GAMES;
+                gameCursor = selected;
+                // `mods` is already fresh (rescanned after every action), so
+                // derive the stats from it - zero SD reads on backout.
+                profiles[selected].modCount  = (int)mods.size();
+                profiles[selected].hasActive =
+                    !mods.empty() && mods.front().active;
+            }
+            else if (kDown & KEY_SELECT) {
+                themeReturn = ST_MODS;
+                themeCursor = g_themeIdx;
+                state = ST_THEMES;
+            }
+            else if (kDown & KEY_X) {
+                disableMod(gp, &status);
+                mods = scanMods(gp);
+                if (modCursor >= (int)mods.size())
+                    modCursor = mods.empty() ? 0 : (int)mods.size() - 1;
+            }
+            else if (kDown & KEY_Y) {
+                tidyLooseMods(gp, &status);
+                mods = scanMods(gp);
+                if (modCursor >= (int)mods.size())
+                    modCursor = mods.empty() ? 0 : (int)mods.size() - 1;
+            }
+            else if (!mods.empty()) {
+                if (kNav & KEY_DOWN)
+                    modCursor = (modCursor + 1) % (int)mods.size();
+                if (kNav & KEY_UP)
+                    modCursor = (modCursor - 1 + (int)mods.size()) % (int)mods.size();
+                if (kDown & KEY_A) {
+                    // On success the activated mod sorts to the top; follow it
+                    // with the cursor so the selection tracks what you just did.
+                    if (activateMod(gp, mods[modCursor], &status))
+                        modCursor = 0;
+                    mods = scanMods(gp);
+                    if (modCursor >= (int)mods.size())
+                        modCursor = mods.empty() ? 0 : (int)mods.size() - 1;
+                }
+            }
+        }
+
+        // ------------------------------ draw -------------------------------
+        g_t += 1.0f / 60.0f;
+
+        // Animation bookkeeping: screen slide-in restarts on state change,
+        // the toast timer restarts when its text changes.
+        static AppState lastState = ST_GAMES;
+        if (state != lastState) {
+            lastState    = state;
+            g_screenAnim = 0.0f;
+            g_selSnap    = true;
+        }
+        if (g_screenAnim < 1.0f) {
+            g_screenAnim += 1.0f / 18.0f;
+            if (g_screenAnim > 1.0f) g_screenAnim = 1.0f;
+        }
+        static std::string lastToast;
+        static float toastBorn = -999.0f;
+        if (status.msg != lastToast) { lastToast = status.msg; toastBorn = g_t; }
+        g_statusAge = g_t - toastBorn;
+
+        C2D_TextBufClear(g_textBuf);
+        C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+
+        C2D_TargetClear(top, T.bgTop);
+        C2D_SceneBegin(top);
+        drawBackground(topParticles, 400);
+        if      (state == ST_GAMES)  drawTopGames(profiles, gameCursor);
+        else if (state == ST_MODS)   drawTopMods(profiles[selected], mods);
+        else                         drawTopThemes();
+
+        C2D_TargetClear(bot, T.bgTop);
+        C2D_SceneBegin(bot);
+        drawBackground(botParticles, 320);
+        if      (state == ST_GAMES)  drawBottomGames(profiles, gameCursor, status);
+        else if (state == ST_MODS)   drawBottomMods(profiles[selected], mods, modCursor, status);
+        else                         drawBottomThemes(themeCursor);
+
+        C3D_FrameEnd(0);
+    }
+
+    C2D_TextBufDelete(g_textBuf);
+    C2D_Fini();
+    C3D_Fini();
+    gfxExit();
+    return 0;
+}

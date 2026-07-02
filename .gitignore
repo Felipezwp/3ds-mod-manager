@@ -1,0 +1,12 @@
+# build outputs
+build/
+*.elf
+*.3dsx
+*.cia
+*.bnr
+*.smdh
+
+# local backups & session logs
+*.bak
+claude-history/
+.claude/

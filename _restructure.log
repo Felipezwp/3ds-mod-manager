@@ -1,0 +1,75 @@
+=== 3ds expansion pack -> 00040000000EDF00_3ds expansion pack ===
+  romfs\effect
+  romfs\model
+  romfs\sound
+  romfs\ui
+=== Eclipse smash -> 00040000000EDF00_Eclipse smash ===
+  romfs\animcmd
+  romfs\cro
+  romfs\effect
+  romfs\item
+  romfs\model
+  romfs\motion
+  romfs\param
+  romfs\sound
+  romfs\stage
+  romfs\ui
+=== Ins4ne sm4sh -> 00040000000EDF00_Ins4ne sm4sh ===
+  romfs\msc
+  romfs\param
+  romfs\sound
+  romfs\ui
+=== Luck pack -> 00040000000EDF00_Luck pack ===
+  romfs\param
+=== Miguel mod pack -> 00040000000EDF00_Miguel mod pack ===
+  romfs\animcmd
+  code.ips  <- codes\USAcode.ips
+  romfs\model
+  romfs\param
+  romfs\sound
+  romfs\stage
+  romfs\ui
+=== Neos -> 00040000000EDF00_Neos ===
+  romfs\animcmd
+  romfs\effect
+  romfs\model
+  romfs\param
+  romfs\sound
+  romfs\stage
+  romfs\ui
+=== Tr4sh -> 00040000000EDF00_Tr4sh ===
+  romfs\animcmd
+  romfs\param
+  romfs\sound
+  romfs\ui
+=== Turbo'd mod -> 00040000000EDF00_Turbo'd mod ===
+  romfs\animcmd
+  romfs\param
+  romfs\stage
+  romfs\ui
+=== unbalanced mod -> 00040000000EDF00_unbalanced mod ===
+  romfs\animcmd
+  romfs\param
+=== USM-eM Winds Edition 1.0 -> 00040000000EDF00_USM-eM Winds Edition 1.0 ===
+  romfs\animcmd
+  romfs\effect
+  romfs\model
+  romfs\param
+  romfs\sound
+  romfs\stage
+  romfs\ui
+=== vanilla -> 00040000000EDF00_vanilla ===
+
+DONE. New sibling folders:
+  00040000000EDF00_3ds expansion pack
+  00040000000EDF00_Backup
+  00040000000EDF00_Eclipse smash
+  00040000000EDF00_Ins4ne sm4sh
+  00040000000EDF00_Luck pack
+  00040000000EDF00_Miguel mod pack
+  00040000000EDF00_Neos
+  00040000000EDF00_Tr4sh
+  00040000000EDF00_Turbo'd mod
+  00040000000EDF00_unbalanced mod
+  00040000000EDF00_USM-eM Winds Edition 1.0
+  00040000000EDF00_vanilla
