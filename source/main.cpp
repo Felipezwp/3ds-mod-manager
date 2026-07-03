@@ -1,5 +1,5 @@
 /*
- * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.3.1
+ * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.3.2
  * ---------------------------------------------------------------------------
  * Swaps the active mod for a game by MOVING folders between a central
  * per-title mod repository and the game's "active" location:
@@ -1610,7 +1610,7 @@ static void drawTopHeader(const char *screenTitle)
     if (lvl)
         C2D_DrawRectSolid(bx + 1, by + 1, 0.5f, 16.0f * lvl / 5.0f, 7, fill);
 
-    drawTextRight(364, 11, 0.42f, T.muted, "3DS Mod Manager v3.3.1");
+    drawTextRight(364, 11, 0.42f, T.muted, "3DS Mod Manager v3.3.2");
 }
 
 static void drawTopFooter()
@@ -1986,7 +1986,7 @@ int main(int argc, char **argv)
 
     // Flush the SMDH attempt trace for off-device diagnosis.
     if (FILE *lf = fopen(LOOKUP_LOG, "w")) {
-        fprintf(lf, "v3.3.1 hits=%d lastRc=%08lX\n", g_smdhHits,
+        fprintf(lf, "v3.3.2 hits=%d lastRc=%08lX\n", g_smdhHits,
                 (unsigned long)g_smdhLastRc);
         fputs(g_smdhLog.c_str(), lf);
         fclose(lf);
@@ -2029,17 +2029,40 @@ int main(int argc, char **argv)
         if (quitT >= 0)
             kDown = 0;                           // no input while fading
 
-        // Touchscreen: tap a row to highlight it, tap it again to activate.
-        // In sub-screens the header's left edge is a back zone.
-        int  touchRow  = -1;
-        bool touchBack = false;
+        // Touchscreen: drag to scroll (the list follows the finger a row at
+        // a time), release without dragging to tap - tap a row to highlight
+        // it, tap it again to activate. Header's left edge is a back zone.
+        // Pure input math every frame; nothing here touches the SD card.
+        static touchPosition tStart;
+        static int  tPrevY    = 0;
+        static bool tDragging = false;
+        static float tAccumY  = 0.0f;
+        int  touchRow  = -1;    // tap released on this viewport slot
+        bool touchBack = false; // tap released in the back zone
+        int  dragRows  = 0;     // cursor rows to move from this frame's drag
+
         if (kDown & KEY_TOUCH) {
+            hidTouchRead(&tStart);
+            tPrevY    = tStart.py;
+            tDragging = false;
+            tAccumY   = 0.0f;
+        } else if (quitT < 0 && (hidKeysHeld() & KEY_TOUCH)) {
             touchPosition tp;
             hidTouchRead(&tp);
-            if (tp.px < 312 && tp.py >= LIST_Y &&
-                tp.py < LIST_Y + LIST_ROWS * ROW_H)
-                touchRow = (int)((tp.py - LIST_Y) / ROW_H);
-            else if (tp.py < 26 && tp.px < 70)
+            tAccumY += (float)(tPrevY - tp.py);   // finger up = forward
+            tPrevY   = tp.py;
+            const int total = tp.py - tStart.py;
+            if (!tDragging && (total > 8 || total < -8)) tDragging = true;
+            if (tDragging) {
+                dragRows = (int)(tAccumY / ROW_H);
+                tAccumY -= dragRows * ROW_H;
+            }
+        }
+        if (quitT < 0 && (hidKeysUp() & KEY_TOUCH) && !tDragging) {
+            if (tStart.px < 312 && tStart.py >= LIST_Y &&
+                tStart.py < LIST_Y + LIST_ROWS * ROW_H)
+                touchRow = (int)((tStart.py - LIST_Y) / ROW_H);
+            else if (tStart.py < 26 && tStart.px < 70)
                 touchBack = true;
         }
 
@@ -2061,6 +2084,13 @@ int main(int argc, char **argv)
             if (kNav & KEY_DOWN) themeCursor = (themeCursor + 1) % NUM_THEMES;
             if (kNav & KEY_UP)   themeCursor = (themeCursor - 1 + NUM_THEMES) % NUM_THEMES;
 
+            if (dragRows) {
+                themeCursor += dragRows;
+                if (themeCursor < 0)           themeCursor = 0;
+                if (themeCursor >= NUM_THEMES) themeCursor = NUM_THEMES - 1;
+                sndPlay(SND_MOVE);
+            }
+
             if (touchRow >= 0 && touchRow < NUM_THEMES) {
                 if (touchRow == themeCursor) touchBack = true;  // keep + close
                 else { themeCursor = touchRow; sndPlay(SND_MOVE); }
@@ -2078,6 +2108,13 @@ int main(int argc, char **argv)
 
             if (n > 0 && (kNav & KEY_DOWN)) gameCursor = (gameCursor + 1) % n;
             if (n > 0 && (kNav & KEY_UP))   gameCursor = (gameCursor - 1 + n) % n;
+
+            if (dragRows && n > 0) {
+                gameCursor += dragRows;
+                if (gameCursor < 0)  gameCursor = 0;
+                if (gameCursor >= n) gameCursor = n - 1;
+                sndPlay(SND_MOVE);
+            }
 
             bool actOpen = false;
             if (touchRow >= 0 && n > 0) {
@@ -2125,6 +2162,13 @@ int main(int argc, char **argv)
         }
         else { // ST_MODS
             const GameProfile &gp = profiles[selected];
+
+            if (dragRows && !mods.empty()) {
+                modCursor += dragRows;
+                if (modCursor < 0)                     modCursor = 0;
+                if (modCursor >= (int)mods.size())     modCursor = (int)mods.size() - 1;
+                sndPlay(SND_MOVE);
+            }
 
             bool actUse = false;
             if (touchRow >= 0 && !mods.empty()) {

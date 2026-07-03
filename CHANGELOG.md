@@ -4,6 +4,12 @@ All notable changes to the 3DS Mod Manager. Versions before this repo was
 created (v3.0) are reconstructed from session notes — early entries are
 approximate.
 
+## v3.3.2 — 2026-07-03
+
+- Swipe to scroll: drag anywhere on the list and it follows your finger a
+  row at a time (clamped at the ends); a release without movement is a tap
+  (select / activate as before). Pure input math — zero I/O per frame.
+
 ## v3.3.1 — 2026-07-03
 
 - Fix crash at launch: v3.3's ndspInit data-aborted because the exheader
