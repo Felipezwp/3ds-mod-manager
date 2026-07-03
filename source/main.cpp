@@ -1,5 +1,5 @@
 /*
- * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.3.2
+ * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.4
  * ---------------------------------------------------------------------------
  * Swaps the active mod for a game by MOVING folders between a central
  * per-title mod repository and the game's "active" location:
@@ -52,6 +52,10 @@
 #include <string>
 #include <utility>        // std::pair (game icon cache)
 #include <vector>
+
+// Single source of truth for the app version (shown in the header, stamped
+// into the lookup log, and compared against GitHub release tags).
+#define APP_VER "3.4.0"
 
 // ---------------------------------------------------------------------------
 // Locations
@@ -1252,6 +1256,158 @@ static Result doGameJump(const std::string &titleIdHex, FS_MediaType media)
 }
 
 // ---------------------------------------------------------------------------
+// Self-updater. A worker thread checks the GitHub releases API, compares the
+// latest tag against APP_VER, downloads the CIA asset, and installs it over
+// this title via AM (the running copy keeps working; the update applies on
+// the next launch). All network + install work stays off the UI thread.
+// ---------------------------------------------------------------------------
+static const char *UPDATE_API =
+    "https://api.github.com/repos/Felipezwp/3ds-mod-manager/releases/latest";
+
+enum UpdState { UPD_IDLE, UPD_CHECKING, UPD_DOWNLOADING, UPD_INSTALLING,
+                UPD_DONE, UPD_UPTODATE, UPD_FAILED };
+static volatile UpdState g_updState = UPD_IDLE;
+static volatile int      g_updPct   = 0;
+static char              g_updTag[32] = "";
+
+// GET with redirect following; appends the body to `out`.
+static Result httpGet(const std::string &url, std::vector<u8> &out,
+                      bool trackPct)
+{
+    std::string cur = url;
+    std::vector<u8> chunk(0x20000);
+    for (int redir = 0; redir < 6; ++redir) {
+        httpcContext ctx;
+        Result rc = httpcOpenContext(&ctx, HTTPC_METHOD_GET, cur.c_str(), 1);
+        if (R_FAILED(rc)) return rc;
+        httpcSetSSLOpt(&ctx, SSLCOPT_DisableVerify); // 3DS root store is ancient
+        httpcAddRequestHeaderField(&ctx, "User-Agent", "3dsmods/" APP_VER);
+        rc = httpcBeginRequest(&ctx);
+        u32 status = 0;
+        if (R_SUCCEEDED(rc)) rc = httpcGetResponseStatusCode(&ctx, &status);
+        if (R_FAILED(rc)) { httpcCloseContext(&ctx); return rc; }
+
+        if (status >= 301 && status <= 308) {
+            char loc[1024];
+            rc = httpcGetResponseHeader(&ctx, "Location", loc, sizeof(loc));
+            httpcCloseContext(&ctx);
+            if (R_FAILED(rc)) return rc;
+            cur = loc;
+            continue;
+        }
+        if (status != 200) { httpcCloseContext(&ctx); return -1; }
+
+        u32 total = 0;
+        httpcGetDownloadSizeState(&ctx, NULL, &total);
+        do {
+            u32 got = 0;
+            rc = httpcDownloadData(&ctx, chunk.data(), chunk.size(), &got);
+            out.insert(out.end(), chunk.begin(), chunk.begin() + got);
+            if (trackPct && total)
+                g_updPct = (int)((u64)out.size() * 100 / total);
+        } while (rc == (Result)HTTPC_RESULTCODE_DOWNLOADPENDING);
+        httpcCloseContext(&ctx);
+        return rc;
+    }
+    return -1;
+}
+
+// "v3.4.1" -> {3,4,1}; missing fields are 0.
+static void parseVer(const char *s, int v[3])
+{
+    v[0] = v[1] = v[2] = 0;
+    if (*s == 'v' || *s == 'V') ++s;
+    sscanf(s, "%d.%d.%d", &v[0], &v[1], &v[2]);
+}
+
+static bool verNewer(const char *tag)
+{
+    int a[3], b[3];
+    parseVer(tag, a);
+    parseVer(APP_VER, b);
+    for (int i = 0; i < 3; ++i) {
+        if (a[i] != b[i]) return a[i] > b[i];
+    }
+    return false;
+}
+
+// Pull `"key":"value"` out of the (flat enough) GitHub JSON.
+static std::string jsonStr(const std::string &js, const std::string &key,
+                           size_t from = 0)
+{
+    const std::string pat = "\"" + key + "\":\"";
+    const size_t p = js.find(pat, from);
+    if (p == std::string::npos) return "";
+    const size_t s = p + pat.size();
+    const size_t e = js.find('"', s);
+    return e == std::string::npos ? "" : js.substr(s, e - s);
+}
+
+static Result installCia(const std::vector<u8> &cia)
+{
+    Handle h;
+    Result rc = AM_StartCiaInstall(MEDIATYPE_SD, &h);
+    if (R_FAILED(rc)) return rc;
+    u64 off = 0;
+    while (off < cia.size()) {
+        const u32 n = (u32)std::min<size_t>(0x10000, cia.size() - off);
+        u32 written = 0;
+        rc = FSFILE_Write(h, &written, off, cia.data() + off, n, 0);
+        if (R_FAILED(rc)) { AM_CancelCIAInstall(h); return rc; }
+        off += written;
+    }
+    return AM_FinishCiaInstall(h);
+}
+
+static void updWorker(void *)
+{
+    g_updState = UPD_CHECKING;
+
+    std::vector<u8> body;
+    if (R_FAILED(httpGet(UPDATE_API, body, false)) || body.empty()) {
+        g_updState = UPD_FAILED;
+        return;
+    }
+    const std::string js((const char *)body.data(), body.size());
+
+    const std::string tag = jsonStr(js, "tag_name");
+    snprintf(g_updTag, sizeof(g_updTag), "%s", tag.c_str());
+    if (tag.empty()) { g_updState = UPD_FAILED; return; }
+    if (!verNewer(tag.c_str())) { g_updState = UPD_UPTODATE; return; }
+
+    // First .cia asset in the release.
+    std::string url;
+    for (size_t p = 0; (p = js.find("\"browser_download_url\":\"", p))
+                       != std::string::npos; ++p) {
+        std::string u = jsonStr(js, "browser_download_url", p);
+        if (u.size() > 4 && u.compare(u.size() - 4, 4, ".cia") == 0) {
+            url = u;
+            break;
+        }
+    }
+    if (url.empty()) { g_updState = UPD_FAILED; return; }
+
+    g_updPct   = 0;
+    g_updState = UPD_DOWNLOADING;
+    std::vector<u8> cia;
+    if (R_FAILED(httpGet(url, cia, true)) || cia.size() < 0x4000) {
+        g_updState = UPD_FAILED;
+        return;
+    }
+
+    g_updState = UPD_INSTALLING;
+    g_updState = R_FAILED(installCia(cia)) ? UPD_FAILED : UPD_DONE;
+}
+
+static void startUpdateCheck()
+{
+    if (g_updState == UPD_CHECKING || g_updState == UPD_DOWNLOADING ||
+        g_updState == UPD_INSTALLING || g_updState == UPD_DONE)
+        return;
+    threadCreate(updWorker, NULL, 32 * 1024, 0x31, -2, true);
+}
+
+// ---------------------------------------------------------------------------
 // Settings (theme persistence)
 // ---------------------------------------------------------------------------
 static void loadSettings()
@@ -1610,7 +1766,7 @@ static void drawTopHeader(const char *screenTitle)
     if (lvl)
         C2D_DrawRectSolid(bx + 1, by + 1, 0.5f, 16.0f * lvl / 5.0f, 7, fill);
 
-    drawTextRight(364, 11, 0.42f, T.muted, "3DS Mod Manager v3.3.2");
+    drawTextRight(364, 11, 0.42f, T.muted, "3DS Mod Manager v" APP_VER);
 }
 
 static void drawTopFooter()
@@ -1873,7 +2029,7 @@ static void drawBottomGames(const std::vector<GameProfile> &profiles, int cursor
                             const Status &st)
 {
     drawBottomChrome("Select a game", cursor, (int)profiles.size(),
-                     G_DPAD " Move  " G_A " Open  " G_X " Play  SELECT Themes");
+                     G_A " Open  " G_X " Play  " G_Y " Update  SEL Themes");
 
     if (profiles.empty()) {
         drawTextCenter(160, 100, 0.5f, T.muted, "No games found");
@@ -1955,9 +2111,13 @@ static void drawBottomThemes(int cursor)
 // ---------------------------------------------------------------------------
 int main(int argc, char **argv)
 {
+    osSetSpeedupEnable(true);   // New3DS: 804MHz + L2 (no-op on old units)
+
     gfxInitDefault();
-    ptmuInit();   // battery level for the header indicator
-    sndInit();    // UI blips (silent if no dspfirm.cdc is dumped)
+    ptmuInit();     // battery level for the header indicator
+    sndInit();      // UI blips (silent if no dspfirm.cdc is dumped)
+    httpcInit(0);   // self-updater: GitHub API + download
+    amInit();       // self-updater: CIA install
     C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
     C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
     C2D_Prepare();
@@ -1986,7 +2146,7 @@ int main(int argc, char **argv)
 
     // Flush the SMDH attempt trace for off-device diagnosis.
     if (FILE *lf = fopen(LOOKUP_LOG, "w")) {
-        fprintf(lf, "v3.3.2 hits=%d lastRc=%08lX\n", g_smdhHits,
+        fprintf(lf, "v" APP_VER " hits=%d lastRc=%08lX\n", g_smdhHits,
                 (unsigned long)g_smdhLastRc);
         fputs(g_smdhLog.c_str(), lf);
         fclose(lf);
@@ -2159,6 +2319,10 @@ int main(int argc, char **argv)
                     sndPlay(SND_ERROR);
                 }
             }
+            else if (kDown & KEY_Y) {
+                startUpdateCheck();
+                sndPlay(SND_CONFIRM);
+            }
         }
         else { // ST_MODS
             const GameProfile &gp = profiles[selected];
@@ -2230,6 +2394,35 @@ int main(int argc, char **argv)
             }
         }
 
+        // Self-updater progress -> status toast (kept fresh every frame so
+        // the download percentage ticks and the toast doesn't time out).
+        switch (g_updState) {
+            case UPD_CHECKING:
+                status = { "Checking for updates...", SK_NEUTRAL };
+                break;
+            case UPD_DOWNLOADING:
+                status = { "Downloading " + std::string(g_updTag) + "... " +
+                           std::to_string(g_updPct) + "%", SK_NEUTRAL };
+                break;
+            case UPD_INSTALLING:
+                status = { "Installing update...", SK_NEUTRAL };
+                break;
+            case UPD_DONE:
+                status = { "Updated to " + std::string(g_updTag) +
+                           " - restart the app!", SK_OK };
+                break;
+            case UPD_UPTODATE:
+                status = { "Up to date (v" APP_VER ").", SK_OK };
+                g_updState = UPD_IDLE;   // one-shot toast
+                break;
+            case UPD_FAILED:
+                status = { "Update failed - check Wi-Fi.", SK_ERR };
+                g_updState = UPD_IDLE;
+                sndPlay(SND_ERROR);
+                break;
+            default: break;
+        }
+
         // ------------------------------ draw -------------------------------
         g_t += 1.0f / 60.0f;
 
@@ -2296,6 +2489,8 @@ int main(int argc, char **argv)
     C2D_TextBufDelete(g_textBuf);
     C2D_Fini();
     C3D_Fini();
+    amExit();
+    httpcExit();
     sndExit();
     ptmuExit();
     gfxExit();

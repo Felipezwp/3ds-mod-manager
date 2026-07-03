@@ -4,6 +4,19 @@ All notable changes to the 3DS Mod Manager. Versions before this repo was
 created (v3.0) are reconstructed from session notes — early entries are
 approximate.
 
+## v3.4 — 2026-07-03
+
+- **Self-updater**: press Y on the game list — a background thread checks
+  the GitHub releases API, downloads the newest CIA, and installs it over
+  the running app via AM (progress in the status toast; restart to apply).
+  Requires http:C + am:net service grants.
+- **New3DS fast mode**: 804 MHz CPU + L2 cache enabled
+  (osSetSpeedupEnable + RSF CpuSpeed/EnableL2Cache) — the app previously
+  ran at 268 MHz even on New3DS hardware. Everything, including boot,
+  is ~3x faster on N3DS.
+- Version string now single-sourced (APP_VER) and compared against
+  release tags.
+
 ## v3.3.2 — 2026-07-03
 
 - Swipe to scroll: drag anywhere on the list and it follows your finger a

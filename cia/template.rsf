@@ -43,9 +43,11 @@ AccessControlInfo:
 
   MemoryType              : Application
   SystemMode              : 64MB
+  # New3DS fast path: 804MHz + L2 cache (paired with osSetSpeedupEnable in
+  # code). Old consoles simply ignore these.
   SystemModeExt           : Legacy
-  CpuSpeed                : 268MHz
-  EnableL2Cache           : false
+  CpuSpeed                : 804MHz
+  EnableL2Cache           : true
   CanWriteSharedPage      : true
 
   # Allowed SVC (supervisor call) numbers. Standard full homebrew set so
@@ -219,6 +221,8 @@ AccessControlInfo:
    - ac:u
    - ptm:u    # battery level for the header indicator
    - dsp::DSP # ndsp UI sounds
+   - http:C   # self-updater: GitHub releases API + CIA download
+   - am:net   # self-updater: CIA install
 
 SystemControlInfo:
   SaveDataSize: 0KB
