@@ -57,7 +57,7 @@
 
 // Single source of truth for the app version (shown in the header, stamped
 // into the lookup log, and compared against GitHub release tags).
-#define APP_VER "3.6.0"
+#define APP_VER "3.6.1"
 
 // ---------------------------------------------------------------------------
 // Locations
@@ -1422,13 +1422,19 @@ static Result installCia(const std::vector<u8> &cia, const char **stage)
     Result rc = AM_StartCiaInstall(MEDIATYPE_SD, &h);
     if (R_FAILED(rc)) return rc;
 
-    *stage = "am-write";
     u64 off = 0;
     while (off < cia.size()) {
         const u32 n = (u32)std::min<size_t>(0x10000, cia.size() - off);
         u32 written = 0;
         rc = FSFILE_Write(h, &written, off, cia.data() + off, n, 0);
-        if (R_FAILED(rc)) { AM_CancelCIAInstall(h); return rc; }
+        if (R_FAILED(rc)) {
+            static char where[24];   // failing offset pinpoints WHAT AM hated
+            snprintf(where, sizeof(where), "am-write@%06lX",
+                     (unsigned long)off);
+            *stage = where;
+            AM_CancelCIAInstall(h);
+            return rc;
+        }
         off += written;
     }
 
@@ -1507,7 +1513,20 @@ static void updWorker(void *)
         }
     } else {
         rc = installCia(cia, &stage);
-        if (R_FAILED(rc)) { updFail(stage, rc); return; }
+        if (R_FAILED(rc)) {
+            updFail(stage, rc);
+            // Graceful fallback: park the CIA where FBI can install it.
+            mkdirs("sdmc:/cias");
+            if (FILE *f = fopen("sdmc:/cias/3dsmods-update.cia", "wb")) {
+                if (fwrite(cia.data(), 1, cia.size(), f) == cia.size()) {
+                    updLog("fallback cia saved");
+                    snprintf(g_updErr, sizeof(g_updErr),
+                             "AM refused - saved to /cias, use FBI");
+                }
+                fclose(f);
+            }
+            return;
+        }
     }
     updLog("installed %s%s", g_updTag, g_is3dsx ? " (3dsx)" : "");
     g_updState = UPD_DONE;
