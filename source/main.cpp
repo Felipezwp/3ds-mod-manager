@@ -57,7 +57,7 @@
 
 // Single source of truth for the app version (shown in the header, stamped
 // into the lookup log, and compared against GitHub release tags).
-#define APP_VER "3.5.1"
+#define APP_VER "3.5.2"
 
 // ---------------------------------------------------------------------------
 // Locations
