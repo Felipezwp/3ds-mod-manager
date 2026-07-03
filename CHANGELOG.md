@@ -4,6 +4,16 @@ All notable changes to the 3DS Mod Manager. Versions before this repo was
 created (v3.0) are reconstructed from session notes — early entries are
 approximate.
 
+## v3.0.1 — 2026-07-02
+
+- Games with zero mods (and nothing active or tidy-able) are dropped from
+  the list after the boot scan — kills leftover-folder ghosts like
+  CTRXplorer for good, regardless of which folder scan registered them
+- Mod lists are cached from the boot scan and kept in sync by every
+  action, so opening a game's mod menu is now zero SD reads (previously
+  each entry re-read every mod's name markers — slow for Smash's 11 mods).
+  External SD changes made mid-session appear after a relaunch.
+
 ## v3.0 — 2026-07-02 — "Release 1" (first tagged release)
 
 UI motion overhaul:

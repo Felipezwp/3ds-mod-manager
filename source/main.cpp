@@ -1,5 +1,5 @@
 /*
- * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.0
+ * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.0.1
  * ---------------------------------------------------------------------------
  * Swaps the active mod for a game by MOVING folders between a central
  * per-title mod repository and the game's "active" location:
@@ -911,10 +911,34 @@ static std::vector<GameProfile> discoverProfiles()
     return profiles;
 }
 
+// ---------------------------------------------------------------------------
+// Mod-list cache. The boot scan already reads every game's mods; keeping the
+// lists means opening a game's menu costs zero SD reads. Every action that
+// changes mods rescans through rescanMods(), which refreshes its cache entry.
+// (External changes made over FTP mid-session appear after a relaunch.)
+// ---------------------------------------------------------------------------
+static std::vector<std::pair<std::string, std::vector<ModEntry>>> g_modCache;
+
+static const std::vector<ModEntry> *cachedMods(const std::string &tid)
+{
+    for (const auto &e : g_modCache)
+        if (e.first == tid) return &e.second;
+    return NULL;
+}
+
+static std::vector<ModEntry> rescanMods(const GameProfile &gp)
+{
+    std::vector<ModEntry> m = scanMods(gp);
+    for (auto &e : g_modCache)
+        if (e.first == gp.titleId) { e.second = m; return m; }
+    g_modCache.push_back(std::make_pair(gp.titleId, m));
+    return m;
+}
+
 // Recompute one game's mod count / active flag (shown in the game list).
 static void refreshStats(GameProfile &gp)
 {
-    std::vector<ModEntry> m = scanMods(gp);
+    std::vector<ModEntry> m = rescanMods(gp);
     gp.modCount  = (int)m.size();
     gp.hasActive = !m.empty() && m.front().active;  // active sorts first
 }
@@ -1309,7 +1333,7 @@ static void drawTopHeader(const char *screenTitle)
              (unsigned)(daySec / 3600), (unsigned)((daySec / 60) % 60));
     drawTextCenter(200, 11, 0.42f, T.muted, clk);
 
-    drawTextRight(388, 11, 0.42f, T.muted, "3DS Mod Manager v3.0");
+    drawTextRight(388, 11, 0.42f, T.muted, "3DS Mod Manager v3.0.1");
 }
 
 static void drawTopFooter()
@@ -1654,9 +1678,15 @@ int main(int argc, char **argv)
     std::vector<GameProfile> profiles = discoverProfiles();
     refreshStats(profiles);
 
+    // A folder alone doesn't make a game: leftover luma/ModMoon dirs with no
+    // mods, nothing active and nothing to tidy would just clutter the list.
+    profiles.erase(std::remove_if(profiles.begin(), profiles.end(),
+                       [](const GameProfile &g) { return g.modCount == 0; }),
+                   profiles.end());
+
     // Flush the SMDH attempt trace for off-device diagnosis.
     if (FILE *lf = fopen(LOOKUP_LOG, "w")) {
-        fprintf(lf, "v3.0 hits=%d lastRc=%08lX\n", g_smdhHits,
+        fprintf(lf, "v3.0.1 hits=%d lastRc=%08lX\n", g_smdhHits,
                 (unsigned long)g_smdhLastRc);
         fputs(g_smdhLog.c_str(), lf);
         fclose(lf);
@@ -1713,7 +1743,11 @@ int main(int argc, char **argv)
             }
             else if (n > 0 && (kDown & KEY_A)) {
                 selected  = gameCursor;
-                mods      = scanMods(profiles[selected]);
+                {   // cache hit = instant menu; miss = scan once and keep
+                    const std::vector<ModEntry> *c =
+                        cachedMods(profiles[selected].titleId);
+                    mods = c ? *c : rescanMods(profiles[selected]);
+                }
                 modCursor = 0;
                 status    = { "", SK_NEUTRAL };
                 g_saltyLoaderOk = ensureSaltyLoader(profiles[selected]);
@@ -1739,13 +1773,13 @@ int main(int argc, char **argv)
             }
             else if (kDown & KEY_X) {
                 disableMod(gp, &status);
-                mods = scanMods(gp);
+                mods = rescanMods(gp);
                 if (modCursor >= (int)mods.size())
                     modCursor = mods.empty() ? 0 : (int)mods.size() - 1;
             }
             else if (kDown & KEY_Y) {
                 tidyLooseMods(gp, &status);
-                mods = scanMods(gp);
+                mods = rescanMods(gp);
                 if (modCursor >= (int)mods.size())
                     modCursor = mods.empty() ? 0 : (int)mods.size() - 1;
             }
@@ -1759,7 +1793,7 @@ int main(int argc, char **argv)
                     // with the cursor so the selection tracks what you just did.
                     if (activateMod(gp, mods[modCursor], &status))
                         modCursor = 0;
-                    mods = scanMods(gp);
+                    mods = rescanMods(gp);
                     if (modCursor >= (int)mods.size())
                         modCursor = mods.empty() ? 0 : (int)mods.size() - 1;
                 }
