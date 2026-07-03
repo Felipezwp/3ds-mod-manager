@@ -4,6 +4,13 @@ All notable changes to the 3DS Mod Manager. Versions before this repo was
 created (v3.0) are reconstructed from session notes — early entries are
 approximate.
 
+## v3.3.1 — 2026-07-03
+
+- Fix crash at launch: v3.3's ndspInit data-aborted because the exheader
+  lacked the DSP memory-region mapping (adding the dsp::DSP service alone
+  isn't enough). Added IORegisterMapping 1ff00000-1ff7ffff + VRAM mapping
+  to the RSF, matching FBI's template.
+
 ## v3.3 — 2026-07-03
 
 - **Touchscreen support**: tap a row to highlight it, tap it again to

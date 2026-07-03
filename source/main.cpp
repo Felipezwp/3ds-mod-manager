@@ -1,5 +1,5 @@
 /*
- * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.3
+ * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.3.1
  * ---------------------------------------------------------------------------
  * Swaps the active mod for a game by MOVING folders between a central
  * per-title mod repository and the game's "active" location:
@@ -1610,7 +1610,7 @@ static void drawTopHeader(const char *screenTitle)
     if (lvl)
         C2D_DrawRectSolid(bx + 1, by + 1, 0.5f, 16.0f * lvl / 5.0f, 7, fill);
 
-    drawTextRight(364, 11, 0.42f, T.muted, "3DS Mod Manager v3.3");
+    drawTextRight(364, 11, 0.42f, T.muted, "3DS Mod Manager v3.3.1");
 }
 
 static void drawTopFooter()
@@ -1986,7 +1986,7 @@ int main(int argc, char **argv)
 
     // Flush the SMDH attempt trace for off-device diagnosis.
     if (FILE *lf = fopen(LOOKUP_LOG, "w")) {
-        fprintf(lf, "v3.3 hits=%d lastRc=%08lX\n", g_smdhHits,
+        fprintf(lf, "v3.3.1 hits=%d lastRc=%08lX\n", g_smdhHits,
                 (unsigned long)g_smdhLastRc);
         fputs(g_smdhLog.c_str(), lf);
         fclose(lf);

@@ -201,6 +201,13 @@ AccessControlInfo:
    - UseCardSpi
 
   # Service access list (subset commonly required by homebrew).
+  # Virtual address mappings: ndsp needs the DSP memory region mapped, or
+  # ndspInit data-aborts at 0x1FF5xxxx (crash dump 20).
+  IORegisterMapping:
+   - 1ff00000-1ff7ffff   # DSP memory
+  MemoryMapping:
+   - 1f000000-1f5fffff:r # VRAM
+
   ServiceAccessControl:
    - cfg:u
    - fs:USER
