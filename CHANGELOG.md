@@ -4,6 +4,16 @@ All notable changes to the 3DS Mod Manager. Versions before this repo was
 created (v3.0) are reconstructed from session notes — early entries are
 approximate.
 
+## v3.6 — 2026-07-03
+
+- **Auto update check on boot**: a silent background check runs after the
+  boot scan; if a newer release exists you get an "Update available —
+  press Y" toast. Offline or up-to-date boots say nothing, and nothing is
+  ever installed without pressing Y.
+- **3dsx-aware self-update**: when launched from the Homebrew Launcher the
+  updater downloads the .3dsx release asset and replaces its own file on
+  the SD (path from argv[0]) instead of installing the CIA title.
+
 ## v3.5.1 — 2026-07-03
 
 - Self-update install failures now log the exact sub-step (am-start /

@@ -57,7 +57,7 @@
 
 // Single source of truth for the app version (shown in the header, stamped
 // into the lookup log, and compared against GitHub release tags).
-#define APP_VER "3.5.2"
+#define APP_VER "3.6.0"
 
 // ---------------------------------------------------------------------------
 // Locations
@@ -1297,11 +1297,20 @@ static const char *UPDATE_API =
     "https://api.github.com/repos/Felipezwp/3ds-mod-manager/releases/latest";
 
 enum UpdState { UPD_IDLE, UPD_CHECKING, UPD_DOWNLOADING, UPD_INSTALLING,
-                UPD_DONE, UPD_UPTODATE, UPD_FAILED };
+                UPD_DONE, UPD_UPTODATE, UPD_AVAILABLE, UPD_FAILED };
 static volatile UpdState g_updState = UPD_IDLE;
 static volatile int      g_updPct   = 0;
 static char              g_updTag[32] = "";
 static char              g_updErr[48] = "";
+
+// Silent mode: the automatic boot check. It only ever surfaces a toast when
+// an update actually exists - offline and up-to-date boots say nothing.
+static volatile bool g_updSilent = false;
+
+// When launched from the Homebrew Launcher, update our own .3dsx file on
+// the SD instead of AM-installing the CIA title.
+static bool        g_is3dsx = false;
+static std::string g_selfPath = "sdmc:/3ds/3dsmods.3dsx";
 
 // Record which stage failed with what code - shown in the toast and written
 // to update.log so failures are diagnosable over FTP.
@@ -1322,8 +1331,9 @@ static void updFail(const char *stage, Result rc)
 {
     snprintf(g_updErr, sizeof(g_updErr), "%s rc=%08lX", stage,
              (unsigned long)rc);
-    updLog("%s", g_updErr);
-    g_updState = UPD_FAILED;
+    updLog("%s%s", g_updSilent ? "(silent) " : "", g_updErr);
+    // Auto-checks fail silently; only a user-triggered check shows an error.
+    g_updState = g_updSilent ? UPD_IDLE : UPD_FAILED;
 }
 
 // GET with redirect following; appends the body to `out`.
@@ -1454,12 +1464,17 @@ static void updWorker(void *)
     if (tag.empty()) { updFail("tag", 0); return; }
     if (!verNewer(tag.c_str())) { g_updState = UPD_UPTODATE; return; }
 
-    // First .cia asset in the release.
+    // The silent boot check stops here: announce, never install unasked.
+    if (g_updSilent) { g_updState = UPD_AVAILABLE; return; }
+
+    // Matching release asset: .3dsx when we ARE a 3dsx, .cia otherwise.
+    const std::string ext = g_is3dsx ? ".3dsx" : ".cia";
     std::string url;
     for (size_t p = 0; (p = js.find("\"browser_download_url\":\"", p))
                        != std::string::npos; ++p) {
         std::string u = jsonStr(js, "browser_download_url", p);
-        if (u.size() > 4 && u.compare(u.size() - 4, 4, ".cia") == 0) {
+        if (u.size() > ext.size() &&
+            u.compare(u.size() - ext.size(), ext.size(), ext) == 0) {
             url = u;
             break;
         }
@@ -1476,19 +1491,36 @@ static void updWorker(void *)
 
     g_updState = UPD_INSTALLING;
     const char *stage = "install";
-    rc = installCia(cia, &stage);
-    if (R_FAILED(rc)) { updFail(stage, rc); return; }
-    updLog("installed %s", g_updTag);
+    if (g_is3dsx) {
+        // Replace our own .3dsx on the SD (write beside it, then swap).
+        stage = "fs-write";
+        const std::string tmp = g_selfPath + ".new";
+        FILE *f = fopen(tmp.c_str(), "wb");
+        if (!f) { updFail(stage, -1); return; }
+        const bool ok = fwrite(cia.data(), 1, cia.size(), f) == cia.size();
+        fclose(f);
+        if (!ok) { remove(tmp.c_str()); updFail(stage, -2); return; }
+        remove(g_selfPath.c_str());
+        if (rename(tmp.c_str(), g_selfPath.c_str()) != 0) {
+            updFail("fs-swap", -3);
+            return;
+        }
+    } else {
+        rc = installCia(cia, &stage);
+        if (R_FAILED(rc)) { updFail(stage, rc); return; }
+    }
+    updLog("installed %s%s", g_updTag, g_is3dsx ? " (3dsx)" : "");
     g_updState = UPD_DONE;
 }
 
-static void startUpdateCheck()
+static void startUpdateCheck(bool silent = false)
 {
     if (g_updState == UPD_CHECKING || g_updState == UPD_DOWNLOADING ||
         g_updState == UPD_INSTALLING || g_updState == UPD_DONE)
         return;
     // Claim the state BEFORE spawning, or two quick presses double-spawn.
-    g_updState = UPD_CHECKING;
+    g_updSilent = silent;
+    g_updState  = UPD_CHECKING;
     threadCreate(updWorker, NULL, 32 * 1024, 0x31, -2, true);
 }
 
@@ -2241,6 +2273,10 @@ static void bootWorker(void *)
 
     g_bootProfiles = std::move(p);
     g_bootReady = true;
+
+    // Quiet background update check now that boot work is done. Says
+    // nothing unless a newer release actually exists.
+    startUpdateCheck(true);
 }
 
 // ---------------------------------------------------------------------------
@@ -2249,6 +2285,13 @@ static void bootWorker(void *)
 int main(int argc, char **argv)
 {
     osSetSpeedupEnable(true);   // New3DS: 804MHz + L2 (no-op on old units)
+
+    // Running from the Homebrew Launcher? Then self-updates rewrite our own
+    // .3dsx (whose path HBL passes in argv[0]) instead of installing a CIA.
+    g_is3dsx = envIsHomebrew();
+    if (argc > 0 && argv && argv[0] &&
+        strncmp(argv[0], "sdmc:/", 6) == 0)
+        g_selfPath = argv[0];
 
     gfxInitDefault();
     ptmuInit();     // battery level for the header indicator
@@ -2528,7 +2571,14 @@ int main(int argc, char **argv)
         // the download percentage ticks and the toast doesn't time out).
         switch (g_updState) {
             case UPD_CHECKING:
-                status = { "Checking for updates...", SK_NEUTRAL };
+                if (!g_updSilent)
+                    status = { "Checking for updates...", SK_NEUTRAL };
+                break;
+            case UPD_AVAILABLE:
+                status = { "Update " + std::string(g_updTag) +
+                           " available - press " G_Y "!", SK_OK };
+                g_updState = UPD_IDLE;   // one-shot; Y starts the install
+                sndPlay(SND_CONFIRM);
                 break;
             case UPD_DOWNLOADING:
                 status = { "Downloading " + std::string(g_updTag) + "... " +
