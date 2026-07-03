@@ -4,6 +4,14 @@ All notable changes to the 3DS Mod Manager. Versions before this repo was
 created (v3.0) are reconstructed from session notes — early entries are
 approximate.
 
+## v3.2.1 — 2026-07-02
+
+- Fix X-launch exiting to HOME instead of starting the game — and, worse,
+  wedging NS so the *next* app launched black-screened (reboot clears it).
+  After `APT_DoApplicationJump` the app must keep pumping `aptMainLoop()`
+  and let the system terminate it; exiting on our own cancelled the pending
+  jump mid-handshake.
+
 ## v3.2 — 2026-07-02
 
 - Launch the highlighted game straight from the app: press X on the game

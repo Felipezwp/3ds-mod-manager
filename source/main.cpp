@@ -1,5 +1,5 @@
 /*
- * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.2
+ * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.2.1
  * ---------------------------------------------------------------------------
  * Swaps the active mod for a game by MOVING folders between a central
  * per-title mod repository and the game's "active" location:
@@ -1529,7 +1529,7 @@ static void drawTopHeader(const char *screenTitle)
     if (lvl)
         C2D_DrawRectSolid(bx + 1, by + 1, 0.5f, 16.0f * lvl / 5.0f, 7, fill);
 
-    drawTextRight(364, 11, 0.42f, T.muted, "3DS Mod Manager v3.2");
+    drawTextRight(364, 11, 0.42f, T.muted, "3DS Mod Manager v3.2.1");
 }
 
 static void drawTopFooter()
@@ -1886,7 +1886,7 @@ int main(int argc, char **argv)
 
     // Flush the SMDH attempt trace for off-device diagnosis.
     if (FILE *lf = fopen(LOOKUP_LOG, "w")) {
-        fprintf(lf, "v3.2 hits=%d lastRc=%08lX\n", g_smdhHits,
+        fprintf(lf, "v3.2.1 hits=%d lastRc=%08lX\n", g_smdhHits,
                 (unsigned long)g_smdhLastRc);
         fputs(g_smdhLog.c_str(), lf);
         fclose(lf);
@@ -1917,6 +1917,7 @@ int main(int argc, char **argv)
     float        quitT = -1.0f;
     std::string  jumpTid;
     FS_MediaType jumpMedia = MEDIATYPE_SD;
+    bool         jumped    = false;   // jump requested; waiting to be closed
 
     while (aptMainLoop()) {
         hidScanInput();
@@ -2070,10 +2071,16 @@ int main(int argc, char **argv)
 
         C3D_FrameEnd(0);
 
-        if (quitT >= 1.0f) {
-            if (!jumpTid.empty())
-                doGameJump(jumpTid, jumpMedia);   // takes effect after exit
-            break;
+        if (quitT >= 1.0f && !jumped) {
+            if (!jumpTid.empty() &&
+                R_SUCCEEDED(doGameJump(jumpTid, jumpMedia))) {
+                // The jump is now pending inside NS. Exiting here would
+                // cancel it (and wedge NS - later launches black-screen),
+                // so keep pumping aptMainLoop and let the system close us.
+                jumped = true;
+            } else {
+                break;   // plain quit, or the jump request failed
+            }
         }
     }
 
