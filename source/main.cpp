@@ -1,5 +1,5 @@
 /*
- * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.2.1
+ * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.2.2
  * ---------------------------------------------------------------------------
  * Swaps the active mod for a game by MOVING folders between a central
  * per-title mod repository and the game's "active" location:
@@ -820,7 +820,13 @@ static std::string readGameName(const GameProfile &gp)
     // SD cache: a hit skips the SMDH probes entirely. "?" (never resolved)
     // is retried only for game titles - a cart may have been inserted.
     if (const std::string *c = cachedName(gp.titleId)) {
-        if (*c != "?") { loadCachedIcon(gp.titleId); return *c; }
+        if (*c != "?") {
+            // A cached name IS a resolved name - count it, or the boot
+            // warning misfires once the cache makes real probes rare.
+            ++g_smdhHits;
+            loadCachedIcon(gp.titleId);
+            return *c;
+        }
         if (!istartsWith(gp.titleId, "00040000")) {
             n = gameNameFromTable(gp.titleId);
             return n.empty() ? categoryName(gp.titleId) : n;
@@ -1529,7 +1535,7 @@ static void drawTopHeader(const char *screenTitle)
     if (lvl)
         C2D_DrawRectSolid(bx + 1, by + 1, 0.5f, 16.0f * lvl / 5.0f, 7, fill);
 
-    drawTextRight(364, 11, 0.42f, T.muted, "3DS Mod Manager v3.2.1");
+    drawTextRight(364, 11, 0.42f, T.muted, "3DS Mod Manager v3.2.2");
 }
 
 static void drawTopFooter()
@@ -1886,7 +1892,7 @@ int main(int argc, char **argv)
 
     // Flush the SMDH attempt trace for off-device diagnosis.
     if (FILE *lf = fopen(LOOKUP_LOG, "w")) {
-        fprintf(lf, "v3.2.1 hits=%d lastRc=%08lX\n", g_smdhHits,
+        fprintf(lf, "v3.2.2 hits=%d lastRc=%08lX\n", g_smdhHits,
                 (unsigned long)g_smdhLastRc);
         fputs(g_smdhLog.c_str(), lf);
         fclose(lf);

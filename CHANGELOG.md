@@ -4,6 +4,13 @@ All notable changes to the 3DS Mod Manager. Versions before this repo was
 created (v3.0) are reconstructed from session notes — early entries are
 approximate.
 
+## v3.2.2 — 2026-07-03
+
+- Fix false "Name lookup failed" warning on every warm boot: the SD cache
+  made real SMDH probes rare, so the zero-hit heuristic only ever saw the
+  always-failing probes (ejected cart, uninstalled titles). Cached names
+  now count as resolved.
+
 ## v3.2.1 — 2026-07-02
 
 - Fix X-launch exiting to HOME instead of starting the game — and, worse,
