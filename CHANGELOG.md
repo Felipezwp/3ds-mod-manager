@@ -4,6 +4,12 @@ All notable changes to the 3DS Mod Manager. Versions before this repo was
 created (v3.0) are reconstructed from session notes — early entries are
 approximate.
 
+## v3.4.1 — 2026-07-03
+
+- Updater failures now report the failing stage and exact result code in
+  the toast and in `3ds/3dsmods/update.log` (v3.4 swallowed them behind a
+  generic "check Wi-Fi").
+
 ## v3.4 — 2026-07-03
 
 - **Self-updater**: press Y on the game list — a background thread checks

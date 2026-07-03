@@ -55,7 +55,7 @@
 
 // Single source of truth for the app version (shown in the header, stamped
 // into the lookup log, and compared against GitHub release tags).
-#define APP_VER "3.4.0"
+#define APP_VER "3.4.1"
 
 // ---------------------------------------------------------------------------
 // Locations
@@ -1269,6 +1269,20 @@ enum UpdState { UPD_IDLE, UPD_CHECKING, UPD_DOWNLOADING, UPD_INSTALLING,
 static volatile UpdState g_updState = UPD_IDLE;
 static volatile int      g_updPct   = 0;
 static char              g_updTag[32] = "";
+static char              g_updErr[48] = "";
+
+// Record which stage failed with what code - shown in the toast and written
+// to update.log so failures are diagnosable over FTP.
+static void updFail(const char *stage, Result rc)
+{
+    snprintf(g_updErr, sizeof(g_updErr), "%s rc=%08lX", stage,
+             (unsigned long)rc);
+    if (FILE *f = fopen("sdmc:/3ds/3dsmods/update.log", "w")) {
+        fprintf(f, "v" APP_VER " %s\n", g_updErr);
+        fclose(f);
+    }
+    g_updState = UPD_FAILED;
+}
 
 // GET with redirect following; appends the body to `out`.
 static Result httpGet(const std::string &url, std::vector<u8> &out,
@@ -1295,7 +1309,11 @@ static Result httpGet(const std::string &url, std::vector<u8> &out,
             cur = loc;
             continue;
         }
-        if (status != 200) { httpcCloseContext(&ctx); return -1; }
+        if (status != 200) {
+            httpcCloseContext(&ctx);
+            return MAKERESULT(RL_PERMANENT, RS_INVALIDSTATE, RM_APPLICATION,
+                              status & 0x3FF);   // surface the HTTP status
+        }
 
         u32 total = 0;
         httpcGetDownloadSizeState(&ctx, NULL, &total);
@@ -1364,15 +1382,13 @@ static void updWorker(void *)
     g_updState = UPD_CHECKING;
 
     std::vector<u8> body;
-    if (R_FAILED(httpGet(UPDATE_API, body, false)) || body.empty()) {
-        g_updState = UPD_FAILED;
-        return;
-    }
+    Result rc = httpGet(UPDATE_API, body, false);
+    if (R_FAILED(rc) || body.empty()) { updFail("api", rc); return; }
     const std::string js((const char *)body.data(), body.size());
 
     const std::string tag = jsonStr(js, "tag_name");
     snprintf(g_updTag, sizeof(g_updTag), "%s", tag.c_str());
-    if (tag.empty()) { g_updState = UPD_FAILED; return; }
+    if (tag.empty()) { updFail("tag", 0); return; }
     if (!verNewer(tag.c_str())) { g_updState = UPD_UPTODATE; return; }
 
     // First .cia asset in the release.
@@ -1385,18 +1401,18 @@ static void updWorker(void *)
             break;
         }
     }
-    if (url.empty()) { g_updState = UPD_FAILED; return; }
+    if (url.empty()) { updFail("asset", 0); return; }
 
     g_updPct   = 0;
     g_updState = UPD_DOWNLOADING;
     std::vector<u8> cia;
-    if (R_FAILED(httpGet(url, cia, true)) || cia.size() < 0x4000) {
-        g_updState = UPD_FAILED;
-        return;
-    }
+    rc = httpGet(url, cia, true);
+    if (R_FAILED(rc) || cia.size() < 0x4000) { updFail("dl", rc); return; }
 
     g_updState = UPD_INSTALLING;
-    g_updState = R_FAILED(installCia(cia)) ? UPD_FAILED : UPD_DONE;
+    rc = installCia(cia);
+    if (R_FAILED(rc)) { updFail("install", rc); return; }
+    g_updState = UPD_DONE;
 }
 
 static void startUpdateCheck()
@@ -2416,7 +2432,7 @@ int main(int argc, char **argv)
                 g_updState = UPD_IDLE;   // one-shot toast
                 break;
             case UPD_FAILED:
-                status = { "Update failed - check Wi-Fi.", SK_ERR };
+                status = { std::string("Update failed: ") + g_updErr, SK_ERR };
                 g_updState = UPD_IDLE;
                 sndPlay(SND_ERROR);
                 break;
