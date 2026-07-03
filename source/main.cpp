@@ -57,7 +57,7 @@
 
 // Single source of truth for the app version (shown in the header, stamped
 // into the lookup log, and compared against GitHub release tags).
-#define APP_VER "3.5.0"
+#define APP_VER "3.5.1"
 
 // ---------------------------------------------------------------------------
 // Locations
@@ -1305,14 +1305,24 @@ static char              g_updErr[48] = "";
 
 // Record which stage failed with what code - shown in the toast and written
 // to update.log so failures are diagnosable over FTP.
+static void updLog(const char *fmt, ...)
+{
+    FILE *f = fopen("sdmc:/3ds/3dsmods/update.log", "a");
+    if (!f) return;
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(f, "v" APP_VER " ");
+    vfprintf(f, fmt, ap);
+    fputc('\n', f);
+    va_end(ap);
+    fclose(f);
+}
+
 static void updFail(const char *stage, Result rc)
 {
     snprintf(g_updErr, sizeof(g_updErr), "%s rc=%08lX", stage,
              (unsigned long)rc);
-    if (FILE *f = fopen("sdmc:/3ds/3dsmods/update.log", "w")) {
-        fprintf(f, "v" APP_VER " %s\n", g_updErr);
-        fclose(f);
-    }
+    updLog("%s", g_updErr);
     g_updState = UPD_FAILED;
 }
 
@@ -1391,11 +1401,18 @@ static std::string jsonStr(const std::string &js, const std::string &key,
     return e == std::string::npos ? "" : js.substr(s, e - s);
 }
 
-static Result installCia(const std::vector<u8> &cia)
+static Result installCia(const std::vector<u8> &cia, const char **stage)
 {
+    // A half-finished earlier attempt leaves a pending title that can wedge
+    // AM_StartCiaInstall; clearing it is harmless when there is none.
+    AM_DeletePendingTitle(MEDIATYPE_SD, 0x0004000005BD3700ULL);
+
+    *stage = "am-start";
     Handle h;
     Result rc = AM_StartCiaInstall(MEDIATYPE_SD, &h);
     if (R_FAILED(rc)) return rc;
+
+    *stage = "am-write";
     u64 off = 0;
     while (off < cia.size()) {
         const u32 n = (u32)std::min<size_t>(0x10000, cia.size() - off);
@@ -1404,6 +1421,8 @@ static Result installCia(const std::vector<u8> &cia)
         if (R_FAILED(rc)) { AM_CancelCIAInstall(h); return rc; }
         off += written;
     }
+
+    *stage = "am-finish";
     return AM_FinishCiaInstall(h);
 }
 
@@ -1422,6 +1441,8 @@ static void updWorker(void *)
         curl_global_init(CURL_GLOBAL_DEFAULT);
         g_netUp = true;
     }
+
+    if (FILE *f = fopen("sdmc:/3ds/3dsmods/update.log", "w")) fclose(f);
 
     std::vector<u8> body;
     Result rc = httpGet(UPDATE_API, body, false);
@@ -1450,10 +1471,14 @@ static void updWorker(void *)
     std::vector<u8> cia;
     rc = httpGet(url, cia, true);
     if (R_FAILED(rc) || cia.size() < 0x4000) { updFail("dl", rc); return; }
+    updLog("dl ok %u bytes hdr=%02X%02X%02X%02X", (unsigned)cia.size(),
+           cia[0], cia[1], cia[2], cia[3]);
 
     g_updState = UPD_INSTALLING;
-    rc = installCia(cia);
-    if (R_FAILED(rc)) { updFail("install", rc); return; }
+    const char *stage = "install";
+    rc = installCia(cia, &stage);
+    if (R_FAILED(rc)) { updFail(stage, rc); return; }
+    updLog("installed %s", g_updTag);
     g_updState = UPD_DONE;
 }
 
