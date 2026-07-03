@@ -1,5 +1,5 @@
 /*
- * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.0.1
+ * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.1
  * ---------------------------------------------------------------------------
  * Swaps the active mod for a game by MOVING folders between a central
  * per-title mod repository and the game's "active" location:
@@ -613,10 +613,98 @@ static void cacheGameIcon(const std::string &titleId, const u16 *px)
     g_gameIcons.push_back(std::make_pair(titleId, img));
 }
 
+// ---------------------------------------------------------------------------
+// Boot cache. SMDH probing costs up to three archive opens per title every
+// boot; names and icons barely ever change, so both persist on the SD card:
+//   names: 3ds/3dsmods/.cache/names.txt  ("<TID>\t<name>"; "?" = unresolved.
+//          Unresolved GAME titles are re-probed - a cart may have appeared -
+//          but system titles never gain an SMDH, so they are not retried.)
+//   icons: 3ds/3dsmods/.cache/<TID>.icn  (raw GPU-tiled 48x48 RGB565)
+// ---------------------------------------------------------------------------
+static const char *CACHE_DIR  = "sdmc:/3ds/3dsmods/.cache";
+static const char *NAME_CACHE = "sdmc:/3ds/3dsmods/.cache/names.txt";
+static std::vector<std::pair<std::string, std::string>> g_nameCache;
+static bool g_nameCacheDirty = false;
+
+static void loadNameCache()
+{
+    FILE *f = fopen(NAME_CACHE, "r");
+    if (!f) return;
+    char line[160];
+    while (fgets(line, sizeof(line), f)) {
+        char *tab = strchr(line, '\t');
+        if (!tab) continue;
+        *tab = 0;
+        std::string name = tab + 1;
+        while (!name.empty() && (name.back() == '\n' || name.back() == '\r'))
+            name.pop_back();
+        if (strlen(line) == 16 && !name.empty())
+            g_nameCache.push_back(std::make_pair(std::string(line), name));
+    }
+    fclose(f);
+}
+
+static void saveNameCache()
+{
+    if (!g_nameCacheDirty) return;
+    mkdirs(CACHE_DIR);
+    if (FILE *f = fopen(NAME_CACHE, "w")) {
+        for (const auto &e : g_nameCache)
+            fprintf(f, "%s\t%s\n", e.first.c_str(), e.second.c_str());
+        fclose(f);
+    }
+    g_nameCacheDirty = false;
+}
+
+static const std::string *cachedName(const std::string &tid)
+{
+    for (const auto &e : g_nameCache)
+        if (iequals(e.first, tid)) return &e.second;
+    return NULL;
+}
+
+static void rememberName(const std::string &tid, const std::string &name)
+{
+    for (auto &e : g_nameCache) {
+        if (!iequals(e.first, tid)) continue;
+        if (e.second != name) { e.second = name; g_nameCacheDirty = true; }
+        return;
+    }
+    g_nameCache.push_back(std::make_pair(tid, name));
+    g_nameCacheDirty = true;
+}
+
+static std::string iconCachePath(const std::string &tid)
+{
+    return std::string(CACHE_DIR) + "/" + tid + ".icn";
+}
+
+static bool loadCachedIcon(const std::string &tid)
+{
+    if (gameIcon(tid)) return true;
+    FILE *f = fopen(iconCachePath(tid).c_str(), "rb");
+    if (!f) return false;
+    static u16 px[48 * 48];
+    const size_t n = fread(px, 1, sizeof(px), f);
+    fclose(f);
+    if (n != sizeof(px)) return false;
+    cacheGameIcon(tid, px);
+    return true;
+}
+
+static void saveIconCache(const std::string &tid, const u16 *px)
+{
+    mkdirs(CACHE_DIR);
+    if (FILE *f = fopen(iconCachePath(tid).c_str(), "wb")) {
+        fwrite(px, 1, 48 * 48 * 2, f);
+        fclose(f);
+    }
+}
+
 // Read a title's real name from its installed SMDH (icon) metadata, the same
 // way FBI does: open the "icon" file of the title's content archive directly.
 // Tries SD, then NAND (system titles), then the game card. "" if not found.
-// A successful read also feeds the game-icon cache.
+// A successful read also feeds the GPU icon cache and both SD caches.
 static std::string smdhGameName(const std::string &titleIdHex)
 {
     const u64 tid = strtoull(titleIdHex.c_str(), NULL, 16);
@@ -638,6 +726,10 @@ static std::string smdhGameName(const std::string &titleIdHex)
     static const FS_MediaType MEDIA[3] = { MEDIATYPE_SD, MEDIATYPE_NAND,
                                            MEDIATYPE_GAME_CARD };
     for (int m = 0; m < 3; ++m) {
+        if (MEDIA[m] == MEDIATYPE_GAME_CARD) {
+            bool in = false;   // don't probe an empty card slot
+            if (R_FAILED(FSUSER_CardSlotIsInserted(&in)) || !in) continue;
+        }
         u32 archPath[4] = { (u32)(tid & 0xFFFFFFFF), (u32)(tid >> 32),
                             (u32)MEDIA[m], 0 };
         u32 filePath[5] = { 0, 0, 2, 0x6E6F6369 /* "icon" */, 0 };
@@ -666,6 +758,7 @@ static std::string smdhGameName(const std::string &titleIdHex)
         }
         smdhLogf("%s m%d OK\n", titleIdHex.c_str(), (int)MEDIA[m]);
         cacheGameIcon(titleIdHex, smdh.largeIcon);
+        saveIconCache(titleIdHex, smdh.largeIcon);
 
         // Prefer English (block 1), fall back to Japanese (block 0).
         for (int lang = 1; lang >= 0; --lang) {
@@ -679,7 +772,12 @@ static std::string smdhGameName(const std::string &titleIdHex)
             size_t nl = s.find('\n');
             if (nl != std::string::npos) s.erase(nl);
             rtrim(s);
-            if (!s.empty()) { ++g_smdhHits; return utf8Sanitize(s); }
+            if (!s.empty()) {
+                ++g_smdhHits;
+                const std::string nm = utf8Sanitize(s);
+                rememberName(titleIdHex, nm);
+                return nm;
+            }
         }
     }
     return "";
@@ -717,14 +815,50 @@ static std::string readGameName(const GameProfile &gp)
 {
     std::string n = readFirstLine(activePath(gp) + "/" + GAMENAME_FILE);
     if (n.empty()) n = readFirstLine(repoPath(gp) + "/" + GAMENAME_FILE);
-    if (!n.empty()) return utf8Sanitize(n);
+    if (!n.empty()) { loadCachedIcon(gp.titleId); return utf8Sanitize(n); }
 
-    n = smdhGameName(gp.titleId);
+    // SD cache: a hit skips the SMDH probes entirely. "?" (never resolved)
+    // is retried only for game titles - a cart may have been inserted.
+    if (const std::string *c = cachedName(gp.titleId)) {
+        if (*c != "?") { loadCachedIcon(gp.titleId); return *c; }
+        if (!istartsWith(gp.titleId, "00040000")) {
+            n = gameNameFromTable(gp.titleId);
+            return n.empty() ? categoryName(gp.titleId) : n;
+        }
+    }
+
+    n = smdhGameName(gp.titleId);   // remembers name + icon on success
     if (!n.empty()) return n;
 
+    rememberName(gp.titleId, "?");
     n = gameNameFromTable(gp.titleId);
     return n.empty() ? categoryName(gp.titleId) : n;
 }
+
+// ---------------------------------------------------------------------------
+// Shared luma/titles listing. Every game's legacy scan needs this directory,
+// so listing it per game made boot O(games x entries) SD reads. One listing
+// is kept and invalidated whenever the app itself moves folders in or out.
+// ---------------------------------------------------------------------------
+static std::vector<std::string> g_lumaList;
+static bool g_lumaListValid = false;
+
+static const std::vector<std::string> &lumaEntries()
+{
+    if (!g_lumaListValid) {
+        g_lumaList.clear();
+        if (DIR *lp = opendir(LUMA_TITLES)) {
+            struct dirent *ent;
+            while ((ent = readdir(lp)) != NULL)
+                if (strcmp(ent->d_name, ".") && strcmp(ent->d_name, ".."))
+                    g_lumaList.push_back(ent->d_name);
+            closedir(lp);
+        }
+        g_lumaListValid = true;
+    }
+    return g_lumaList;
+}
+static void invalidateLumaList() { g_lumaListValid = false; }
 
 // ---------------------------------------------------------------------------
 // Legacy-location scan, shared by the mod list and Tidy so they always agree.
@@ -739,13 +873,11 @@ static std::vector<LooseItem> collectLoose(const GameProfile &gp)
 {
     std::vector<LooseItem> items;
 
-    // Loose folders in luma/titles.
-    if (DIR *lp = opendir(LUMA_TITLES)) {
+    // Loose folders in luma/titles (from the shared cached listing).
+    {
         const std::string pfx = gp.titleId + "_";
         const std::string dis = "Disabled" + gp.titleId;
-        struct dirent *ent;
-        while ((ent = readdir(lp)) != NULL) {
-            const std::string name = ent->d_name;
+        for (const std::string &name : lumaEntries()) {
             std::string fb;
             if (istartsWith(name, pfx))      fb = name.substr(pfx.size());
             else if (iequals(name, dis))     fb = FALLBACK_NAME;
@@ -754,7 +886,6 @@ static std::vector<LooseItem> collectLoose(const GameProfile &gp)
             if (!isDir(full)) continue;
             items.push_back({ full, fb });
         }
-        closedir(lp);
     }
 
     // For SaltySD titles the bare luma folder is the loader home, not the
@@ -862,17 +993,13 @@ static std::vector<GameProfile> discoverProfiles()
         if (dup == ids.end()) ids.push_back(id);
     };
 
-    if (DIR *dp = opendir(LUMA_TITLES)) {
-        struct dirent *ent;
-        while ((ent = readdir(dp)) != NULL) {
-            std::string id = titleIdOf(ent->d_name);
-            if (id.empty()) continue;
-            // Empty leftover folders (browserhax/cheat-tool debris) are not
-            // games worth listing; repo folders still register below.
-            if (!dirNonEmpty(std::string(LUMA_TITLES) + "/" + ent->d_name)) continue;
-            addId(id);
-        }
-        closedir(dp);
+    for (const std::string &name : lumaEntries()) {
+        std::string id = titleIdOf(name.c_str());
+        if (id.empty()) continue;
+        // Empty leftover folders (browserhax/cheat-tool debris) are not
+        // games worth listing; repo folders still register below.
+        if (!dirNonEmpty(std::string(LUMA_TITLES) + "/" + name)) continue;
+        addId(id);
     }
 
     for (const char *root : { MOD_REPO, MODMOON_REPO }) {
@@ -994,6 +1121,7 @@ static bool activateMod(const GameProfile &gp, const ModEntry &target,
         if (hasActive) saltyRewrap(stashed);
     }
 
+    invalidateLumaList();               // folders moved in/out of luma/titles
     g_saltyLoaderOk = ensureSaltyLoader(gp);
     *st = { "Activated: " + modDisplayName(ap, "mod"), SK_OK };
     if (!g_saltyLoaderOk)
@@ -1023,6 +1151,7 @@ static bool disableMod(const GameProfile &gp, Status *st)
     }
     if (isSalty(gp)) saltyRewrap(repoModPath(gp, folder));
 
+    invalidateLumaList();               // folders moved in/out of luma/titles
     g_saltyLoaderOk = ensureSaltyLoader(gp);
     *st = { "Mods disabled - game now runs vanilla.", SK_OK };
     return true;
@@ -1057,6 +1186,7 @@ static bool tidyLooseMods(const GameProfile &gp, Status *st)
         }
     }
 
+    invalidateLumaList();               // folders moved in/out of luma/titles
     g_saltyLoaderOk = ensureSaltyLoader(gp);
 
     if (failed) {
@@ -1333,7 +1463,29 @@ static void drawTopHeader(const char *screenTitle)
              (unsigned)(daySec / 3600), (unsigned)((daySec / 60) % 60));
     drawTextCenter(200, 11, 0.42f, T.muted, clk);
 
-    drawTextRight(388, 11, 0.42f, T.muted, "3DS Mod Manager v3.0.1");
+    // Battery (ptm:u), polled every ~2 s. Green > yellow > red; a slow white
+    // pulse means charging.
+    static u8  battLvl = 5, battChg = 0;
+    static int battTick = 0;
+    if (battTick-- <= 0) {
+        battTick = 120;
+        PTMU_GetBatteryLevel(&battLvl);
+        PTMU_GetBatteryChargeState(&battChg);
+    }
+    const float bx = 370, by = 12;
+    C2D_DrawRectSolid(bx, by, 0.5f, 18, 9, T.muted);            // shell
+    C2D_DrawRectSolid(bx + 18, by + 2.5f, 0.5f, 2, 4, T.muted); // nub
+    C2D_DrawRectSolid(bx + 1, by + 1, 0.5f, 16, 7, T.bgTop);    // hollow
+    u32 fill = CLR_GREEN;
+    if      (battLvl <= 1) fill = CLR_RED;
+    else if (battLvl == 2) fill = CLR_YELLOW;
+    if (battChg)
+        fill = lerpColor(fill, CLR_WHITE, 0.25f + 0.25f * sinf(g_t * 3.0f));
+    const u8 lvl = battLvl > 5 ? 5 : battLvl;
+    if (lvl)
+        C2D_DrawRectSolid(bx + 1, by + 1, 0.5f, 16.0f * lvl / 5.0f, 7, fill);
+
+    drawTextRight(364, 11, 0.42f, T.muted, "3DS Mod Manager v3.1");
 }
 
 static void drawTopFooter()
@@ -1660,6 +1812,7 @@ static void drawBottomThemes(int cursor)
 int main(int argc, char **argv)
 {
     gfxInitDefault();
+    ptmuInit();   // battery level for the header indicator
     C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
     C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
     C2D_Prepare();
@@ -1674,9 +1827,11 @@ int main(int argc, char **argv)
     std::vector<Particle> botParticles = makeParticles(4, 14, 320);
 
     loadSettings();
+    loadNameCache();
 
     std::vector<GameProfile> profiles = discoverProfiles();
     refreshStats(profiles);
+    saveNameCache();   // persist anything newly resolved this boot
 
     // A folder alone doesn't make a game: leftover luma/ModMoon dirs with no
     // mods, nothing active and nothing to tidy would just clutter the list.
@@ -1686,7 +1841,7 @@ int main(int argc, char **argv)
 
     // Flush the SMDH attempt trace for off-device diagnosis.
     if (FILE *lf = fopen(LOOKUP_LOG, "w")) {
-        fprintf(lf, "v3.0.1 hits=%d lastRc=%08lX\n", g_smdhHits,
+        fprintf(lf, "v3.1 hits=%d lastRc=%08lX\n", g_smdhHits,
                 (unsigned long)g_smdhLastRc);
         fputs(g_smdhLog.c_str(), lf);
         fclose(lf);
@@ -1711,13 +1866,18 @@ int main(int argc, char **argv)
         status = { std::string("Name lookup failed: 0x") + rcbuf, SK_WARN };
     }
 
+    // Quit fade: -1 = running; >= 0 counts up to 1 while fading to black.
+    float quitT = -1.0f;
+
     while (aptMainLoop()) {
         hidScanInput();
-        const u32 kDown = hidKeysDown();         // one-shot: actions
-        const u32 kNav  = hidKeysDownRepeat();   // auto-repeats: hold to scroll
+        u32 kDown      = hidKeysDown();          // one-shot: actions
+        const u32 kNav = quitT < 0 ? hidKeysDownRepeat() : 0;
 
-        if (kDown & KEY_START)
-            break;
+        if (quitT < 0 && (kDown & KEY_START))
+            quitT = 0.0f;                        // start the fade-out
+        if (quitT >= 0)
+            kDown = 0;                           // no input while fading
 
         // ------------------------------ input ------------------------------
         if (state == ST_THEMES) {
@@ -1823,12 +1983,21 @@ int main(int argc, char **argv)
         C2D_TextBufClear(g_textBuf);
         C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
 
+        // Fade-to-black overlay alpha while quitting.
+        u8 fadeA = 0;
+        if (quitT >= 0) {
+            quitT += 1.0f / 24.0f;
+            fadeA = (u8)(easeOutCubic(quitT) * 255.0f);
+        }
+
         C2D_TargetClear(top, T.bgTop);
         C2D_SceneBegin(top);
         drawBackground(topParticles, 400);
         if      (state == ST_GAMES)  drawTopGames(profiles, gameCursor);
         else if (state == ST_MODS)   drawTopMods(profiles[selected], mods);
         else                         drawTopThemes();
+        if (fadeA) C2D_DrawRectSolid(0, 0, 0.9f, 400, 240,
+                                     C2D_Color32(0, 0, 0, fadeA));
 
         C2D_TargetClear(bot, T.bgTop);
         C2D_SceneBegin(bot);
@@ -1836,13 +2005,19 @@ int main(int argc, char **argv)
         if      (state == ST_GAMES)  drawBottomGames(profiles, gameCursor, status);
         else if (state == ST_MODS)   drawBottomMods(profiles[selected], mods, modCursor, status);
         else                         drawBottomThemes(themeCursor);
+        if (fadeA) C2D_DrawRectSolid(0, 0, 0.9f, 320, 240,
+                                     C2D_Color32(0, 0, 0, fadeA));
 
         C3D_FrameEnd(0);
+
+        if (quitT >= 1.0f)
+            break;
     }
 
     C2D_TextBufDelete(g_textBuf);
     C2D_Fini();
     C3D_Fini();
+    ptmuExit();
     gfxExit();
     return 0;
 }

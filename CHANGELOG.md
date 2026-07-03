@@ -4,6 +4,18 @@ All notable changes to the 3DS Mod Manager. Versions before this repo was
 created (v3.0) are reconstructed from session notes — early entries are
 approximate.
 
+## v3.1 — 2026-07-02
+
+- **Much faster launch.** Names and icons now persist in an SD cache
+  (`3ds/3dsmods/.cache/`), so the up-to-three SMDH archive probes per title
+  happen once ever instead of every boot; unresolvable system titles are
+  never re-probed (game carts still are, in case one was inserted). The
+  game-card slot is skipped entirely when empty, and `luma/titles` is
+  listed once per boot instead of once per game.
+- Fade-to-black animation when quitting with START
+- Battery indicator in the top header (green/yellow/red, pulses while
+  charging), polled via ptm:u every ~2 s
+
 ## v3.0.1 — 2026-07-02
 
 - Games with zero mods (and nothing active or tidy-able) are dropped from
