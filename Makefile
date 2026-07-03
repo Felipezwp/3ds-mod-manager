@@ -32,6 +32,11 @@ APP_AUTHOR		:=	Homebrew
 APP_PRODUCT_CODE	:=	CTR-P-MODM
 APP_UNIQUE_ID		:=	0x5BD37
 
+# TMD title version: major<<10 | minor<<4 | micro. Bump on every release --
+# the HOME menu caches title icons and only refreshes them when an install
+# registers as an update (version increased).
+APP_VERSION			:=	3073	# 3.0.1
+
 # Banner / icon assets used by makerom when building the CIA.
 ICON			:=	$(CURDIR)/icon.png
 BANNER_IMAGE	:=	$(CURDIR)/cia/banner.png
@@ -219,7 +224,8 @@ $(OUTPUT).cia	:	$(OUTPUT).elf $(OUTPUT).smdh $(OUTPUT).bnr $(RSF)
 		-banner $(OUTPUT).bnr \
 		-DAPP_TITLE="$(APP_TITLE)" \
 		-DAPP_PRODUCT_CODE="$(APP_PRODUCT_CODE)" \
-		-DAPP_UNIQUE_ID="$(APP_UNIQUE_ID)"
+		-DAPP_UNIQUE_ID="$(APP_UNIQUE_ID)" \
+		-ver $(APP_VERSION)
 	@echo "built ... $(notdir $@)"
 
 #---------------------------------------------------------------------------------
