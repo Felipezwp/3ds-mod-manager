@@ -4,6 +4,17 @@ All notable changes to the 3DS Mod Manager. Versions before this repo was
 created (v3.0) are reconstructed from session notes — early entries are
 approximate.
 
+## v3.5 — 2026-07-03
+
+- **Instant launch**: the entire boot pipeline (DSP firmware, name/icon
+  caches, directory scans, stats) moved to a worker thread — the UI renders
+  on the first frame with a "Scanning" state that fills in as soon as the
+  worker lands. Icons upload to the GPU via a queue on the main thread.
+- Faster game handoff: the launch fade runs twice as fast as the quit fade
+- Network (1 MB socket buffer + curl) now initializes lazily on the first
+  update check instead of at boot
+- Fixed a race where two quick Y presses could spawn two update checks
+
 ## v3.4.2 — 2026-07-03
 
 - Updater networking rewritten on libcurl + mbedTLS over soc:U sockets.

@@ -1,5 +1,5 @@
 /*
- * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.4
+ * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.5
  * ---------------------------------------------------------------------------
  * Swaps the active mod for a game by MOVING folders between a central
  * per-title mod repository and the game's "active" location:
@@ -57,7 +57,7 @@
 
 // Single source of truth for the app version (shown in the header, stamped
 // into the lookup log, and compared against GitHub release tags).
-#define APP_VER "3.4.2"
+#define APP_VER "3.5.0"
 
 // ---------------------------------------------------------------------------
 // Locations
@@ -591,7 +591,15 @@ static void smdhLogf(const char *fmt, ...)
 // Title ID. SMDH stores the icon in the GPU's native tiled RGB565 layout, so
 // tile rows copy straight into a 64x64 texture (textures need pow2 sides).
 // ---------------------------------------------------------------------------
+// The boot scan runs on a worker thread, but GPU textures must be created
+// on the main thread: workers enqueue raw pixels, the main loop drains the
+// queue between frames. g_gameIcons itself is main-thread-only.
 static std::vector<std::pair<std::string, C2D_Image>> g_gameIcons;
+
+struct PendingIcon { std::string tid; std::vector<u16> px; };
+static LightLock                 g_iconLock;
+static std::vector<PendingIcon>  g_pendingIcons;
+static std::vector<std::string>  g_iconTids;   // every tid ever enqueued
 
 static const C2D_Image *gameIcon(const std::string &titleId)
 {
@@ -600,23 +608,42 @@ static const C2D_Image *gameIcon(const std::string &titleId)
     return NULL;
 }
 
+// Thread-safe: remembers the pixels; the texture is built by drainIcons().
 static void cacheGameIcon(const std::string &titleId, const u16 *px)
 {
-    if (gameIcon(titleId)) return;
+    LightLock_Lock(&g_iconLock);
+    for (const auto &t : g_iconTids)
+        if (t == titleId) { LightLock_Unlock(&g_iconLock); return; }
+    g_iconTids.push_back(titleId);
+    PendingIcon pi;
+    pi.tid = titleId;
+    pi.px.assign(px, px + 48 * 48);
+    g_pendingIcons.push_back(std::move(pi));
+    LightLock_Unlock(&g_iconLock);
+}
 
-    C3D_Tex *tex = (C3D_Tex *)malloc(sizeof(C3D_Tex));
-    if (!tex) return;
-    if (!C3D_TexInit(tex, 64, 64, GPU_RGB565)) { free(tex); return; }
+// Main thread, between frames: turn queued pixels into GPU textures.
+static void drainIcons()
+{
+    LightLock_Lock(&g_iconLock);
+    std::vector<PendingIcon> batch;
+    batch.swap(g_pendingIcons);
+    LightLock_Unlock(&g_iconLock);
 
-    // 48x48 = 6 rows of 6 8x8 tiles (128 bytes each); a 64-wide row holds 8.
-    u16 *dst = (u16 *)tex->data;
-    for (int ty = 0; ty < 6; ++ty)
-        memcpy(dst + ty * 64 * 8, px + ty * 48 * 8, 48 * 8 * 2);
-    C3D_TexSetFilter(tex, GPU_LINEAR, GPU_LINEAR);
-
-    static const Tex3DS_SubTexture sub = { 48, 48, 0.0f, 1.0f, 0.75f, 0.25f };
-    const C2D_Image img = { tex, &sub };
-    g_gameIcons.push_back(std::make_pair(titleId, img));
+    for (const PendingIcon &pi : batch) {
+        C3D_Tex *tex = (C3D_Tex *)malloc(sizeof(C3D_Tex));
+        if (!tex) continue;
+        if (!C3D_TexInit(tex, 64, 64, GPU_RGB565)) { free(tex); continue; }
+        // 48x48 = 6 rows of 6 8x8 tiles (128 B each); a 64-wide row holds 8.
+        u16 *dst = (u16 *)tex->data;
+        for (int ty = 0; ty < 6; ++ty)
+            memcpy(dst + ty * 64 * 8, pi.px.data() + ty * 48 * 8, 48 * 8 * 2);
+        C3D_TexSetFilter(tex, GPU_LINEAR, GPU_LINEAR);
+        static const Tex3DS_SubTexture sub = { 48, 48, 0.0f, 1.0f,
+                                               0.75f, 0.25f };
+        const C2D_Image img = { tex, &sub };
+        g_gameIcons.push_back(std::make_pair(pi.tid, img));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -685,9 +712,19 @@ static std::string iconCachePath(const std::string &tid)
     return std::string(CACHE_DIR) + "/" + tid + ".icn";
 }
 
+static bool iconKnown(const std::string &tid)
+{
+    LightLock_Lock(&g_iconLock);
+    bool known = false;
+    for (const auto &t : g_iconTids)
+        if (t == tid) { known = true; break; }
+    LightLock_Unlock(&g_iconLock);
+    return known;
+}
+
 static bool loadCachedIcon(const std::string &tid)
 {
-    if (gameIcon(tid)) return true;
+    if (iconKnown(tid)) return true;
     FILE *f = fopen(iconCachePath(tid).c_str(), "rb");
     if (!f) return false;
     static u16 px[48 * 48];
@@ -1082,13 +1119,6 @@ static void refreshStats(GameProfile &gp)
     gp.hasActive = !m.empty() && m.front().active;  // active sorts first
 }
 
-// Full recompute; every scanMods re-lists luma/titles + ModMoon + saltysd,
-// so this costs dozens of SD round-trips - boot only. Interactive paths
-// refresh just the game that changed.
-static void refreshStats(std::vector<GameProfile> &profiles)
-{
-    for (GameProfile &gp : profiles) refreshStats(gp);
-}
 
 // ---------------------------------------------------------------------------
 // Activate a stored mod. Two metadata-only moves, no deletion:
@@ -1377,9 +1407,21 @@ static Result installCia(const std::vector<u8> &cia)
     return AM_FinishCiaInstall(h);
 }
 
+static bool g_netUp = false;   // soc + curl brought up on first check
+
 static void updWorker(void *)
 {
-    g_updState = UPD_CHECKING;
+    // Networking is initialized lazily so boot never pays for the 1 MB
+    // socket buffer or curl setup - only the first update check does.
+    if (!g_netUp) {
+        u32 *socBuf = (u32 *)memalign(0x1000, 0x100000);
+        if (!socBuf || R_FAILED(socInit(socBuf, 0x100000))) {
+            updFail("soc", -1);
+            return;
+        }
+        curl_global_init(CURL_GLOBAL_DEFAULT);
+        g_netUp = true;
+    }
 
     std::vector<u8> body;
     Result rc = httpGet(UPDATE_API, body, false);
@@ -1420,6 +1462,8 @@ static void startUpdateCheck()
     if (g_updState == UPD_CHECKING || g_updState == UPD_DOWNLOADING ||
         g_updState == UPD_INSTALLING || g_updState == UPD_DONE)
         return;
+    // Claim the state BEFORE spawning, or two quick presses double-spawn.
+    g_updState = UPD_CHECKING;
     threadCreate(updWorker, NULL, 32 * 1024, 0x31, -2, true);
 }
 
@@ -1713,6 +1757,10 @@ static void sndExit()
         if (g_sndData[i]) linearFree(g_sndData[i]);
 }
 
+// Threaded boot handshake (worker defined near main; the draw code only
+// needs the flag to render the scanning state).
+static volatile bool g_bootReady = false;
+
 // ---------------------------------------------------------------------------
 // Motion. Everything animates by interpolating draw coordinates per frame -
 // the same batched quads render either way, so 60 fps costs nothing extra.
@@ -1811,9 +1859,15 @@ static void drawTopGames(const std::vector<GameProfile> &profiles, int cursor)
 
     if (profiles.empty()) {
         drawCard(20, 60, 360, 120);
-        drawTextCenter(200, 95, 0.55f, CLR_YELLOW, "No games found");
-        drawTextCenter(200, 125, 0.42f, T.muted,
-                       "Add mods to 3ds/3dsmods/<TitleID>/");
+        if (!g_bootReady) {
+            drawTextCenter(200, 95, 0.55f, CLR_WHITE, "Scanning your games");
+            drawTextCenter(200, 125, 0.42f, T.muted,
+                           "Reading names, icons and mods...");
+        } else {
+            drawTextCenter(200, 95, 0.55f, CLR_YELLOW, "No games found");
+            drawTextCenter(200, 125, 0.42f, T.muted,
+                           "Add mods to 3ds/3dsmods/<TitleID>/");
+        }
         drawTopFooter();
         return;
     }
@@ -2048,8 +2102,15 @@ static void drawBottomGames(const std::vector<GameProfile> &profiles, int cursor
                      G_A " Open  " G_X " Play  " G_Y " Update  SEL Themes");
 
     if (profiles.empty()) {
-        drawTextCenter(160, 100, 0.5f, T.muted, "No games found");
-        drawTextCenter(160, 125, 0.4f, T.muted, "3ds/3dsmods/<TitleID>/<mod>/");
+        if (!g_bootReady) {
+            const int dots = 1 + ((int)(g_t * 2.5f) % 3);
+            drawTextCenter(160, 100, 0.5f, T.muted,
+                           std::string("Scanning") + std::string(dots, '.'));
+        } else {
+            drawTextCenter(160, 100, 0.5f, T.muted, "No games found");
+            drawTextCenter(160, 125, 0.4f, T.muted,
+                           "3ds/3dsmods/<TitleID>/<mod>/");
+        }
         return;
     }
 
@@ -2123,6 +2184,41 @@ static void drawBottomThemes(int cursor)
 }
 
 // ---------------------------------------------------------------------------
+// Threaded boot: the whole discovery pipeline (DSP firmware load, name/icon
+// caches, directory scans, stats) runs off the UI thread so the first frame
+// renders immediately. The worker publishes the finished profile list via
+// g_bootReady; icons arrive through the pending-icon queue.
+// ---------------------------------------------------------------------------
+static std::vector<GameProfile> g_bootProfiles;
+
+static void bootWorker(void *)
+{
+    sndInit();          // reads dspfirm.cdc from SD - off the boot path
+    loadNameCache();
+
+    std::vector<GameProfile> p = discoverProfiles();
+    for (GameProfile &gp : p)
+        refreshStats(gp);
+    // A folder alone doesn't make a game: leftover luma/ModMoon dirs with
+    // no mods, nothing active and nothing to tidy would clutter the list.
+    p.erase(std::remove_if(p.begin(), p.end(),
+                [](const GameProfile &g) { return g.modCount == 0; }),
+            p.end());
+    saveNameCache();
+
+    // Flush the SMDH attempt trace for off-device diagnosis.
+    if (FILE *lf = fopen(LOOKUP_LOG, "w")) {
+        fprintf(lf, "v" APP_VER " hits=%d lastRc=%08lX\n", g_smdhHits,
+                (unsigned long)g_smdhLastRc);
+        fputs(g_smdhLog.c_str(), lf);
+        fclose(lf);
+    }
+
+    g_bootProfiles = std::move(p);
+    g_bootReady = true;
+}
+
+// ---------------------------------------------------------------------------
 // Program entry point.
 // ---------------------------------------------------------------------------
 int main(int argc, char **argv)
@@ -2131,12 +2227,7 @@ int main(int argc, char **argv)
 
     gfxInitDefault();
     ptmuInit();     // battery level for the header indicator
-    sndInit();      // UI blips (silent if no dspfirm.cdc is dumped)
-    // Self-updater networking: curl over soc:U (see httpGet for why).
-    static u32 *socBuf = (u32 *)memalign(0x1000, 0x100000);
-    if (socBuf) socInit(socBuf, 0x100000);
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-    amInit();       // self-updater: CIA install
+    amInit();       // self-updater: CIA install (cheap; net init is lazy)
     C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
     C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
     C2D_Prepare();
@@ -2150,26 +2241,13 @@ int main(int argc, char **argv)
     std::vector<Particle> topParticles = makeParticles(5, 18, 400);
     std::vector<Particle> botParticles = makeParticles(4, 14, 320);
 
-    loadSettings();
-    loadNameCache();
+    loadSettings();   // theme must be right on the very first frame
 
-    std::vector<GameProfile> profiles = discoverProfiles();
-    refreshStats(profiles);
-    saveNameCache();   // persist anything newly resolved this boot
-
-    // A folder alone doesn't make a game: leftover luma/ModMoon dirs with no
-    // mods, nothing active and nothing to tidy would just clutter the list.
-    profiles.erase(std::remove_if(profiles.begin(), profiles.end(),
-                       [](const GameProfile &g) { return g.modCount == 0; }),
-                   profiles.end());
-
-    // Flush the SMDH attempt trace for off-device diagnosis.
-    if (FILE *lf = fopen(LOOKUP_LOG, "w")) {
-        fprintf(lf, "v" APP_VER " hits=%d lastRc=%08lX\n", g_smdhHits,
-                (unsigned long)g_smdhLastRc);
-        fputs(g_smdhLog.c_str(), lf);
-        fclose(lf);
-    }
+    // Everything slow happens on the boot worker; the UI starts now.
+    LightLock_Init(&g_iconLock);
+    std::vector<GameProfile> profiles;
+    bool bootLoaded = false;
+    threadCreate(bootWorker, NULL, 64 * 1024, 0x31, -2, true);
 
     enum AppState { ST_GAMES, ST_MODS, ST_THEMES };
     AppState state       = ST_GAMES;
@@ -2199,6 +2277,14 @@ int main(int argc, char **argv)
     bool         jumped    = false;   // jump requested; waiting to be closed
 
     while (aptMainLoop()) {
+        // Adopt the boot worker's results the moment they're ready, and
+        // turn any queued icon pixels into GPU textures (main thread only).
+        if (!bootLoaded && g_bootReady) {
+            profiles.swap(g_bootProfiles);
+            bootLoaded = true;
+        }
+        drainIcons();
+
         hidScanInput();
         u32 kDown      = hidKeysDown();          // one-shot: actions
         const u32 kNav = quitT < 0 ? hidKeysDownRepeat() : 0;
@@ -2468,7 +2554,9 @@ int main(int argc, char **argv)
         // Fade-to-black overlay alpha while quitting.
         u8 fadeA = 0;
         if (quitT >= 0) {
-            quitT += 1.0f / 24.0f;
+            // Launching a game fades twice as fast as quitting - handoff
+            // should feel urgent.
+            quitT += jumpTid.empty() ? 1.0f / 24.0f : 1.0f / 12.0f;
             fadeA = (u8)(easeOutCubic(quitT) * 255.0f);
         }
 
@@ -2492,7 +2580,9 @@ int main(int argc, char **argv)
 
         C3D_FrameEnd(0);
 
-        if (quitT >= 1.0f && !jumped) {
+        // Hold the black screen until the boot worker is done - tearing
+        // down services underneath its FS calls would crash on exit.
+        if (quitT >= 1.0f && !jumped && g_bootReady) {
             if (!jumpTid.empty() &&
                 R_SUCCEEDED(doGameJump(jumpTid, jumpMedia))) {
                 // The jump is now pending inside NS. Exiting here would
@@ -2509,8 +2599,7 @@ int main(int argc, char **argv)
     C2D_Fini();
     C3D_Fini();
     amExit();
-    curl_global_cleanup();
-    socExit();
+    if (g_netUp) { curl_global_cleanup(); socExit(); }
     sndExit();
     ptmuExit();
     gfxExit();
