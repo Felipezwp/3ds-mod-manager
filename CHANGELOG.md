@@ -4,6 +4,12 @@ All notable changes to the 3DS Mod Manager. Versions before this repo was
 created (v3.0) are reconstructed from session notes — early entries are
 approximate.
 
+## v3.2 — 2026-07-02
+
+- Launch the highlighted game straight from the app: press X on the game
+  list. Detects whether the title lives on SD, game card, or NAND, fades
+  out, and APT-jumps into the game — activate a mod and go.
+
 ## v3.1 — 2026-07-02
 
 - **Much faster launch.** Names and icons now persist in an SD cache

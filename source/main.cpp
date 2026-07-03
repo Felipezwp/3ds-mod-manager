@@ -1,5 +1,5 @@
 /*
- * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.1
+ * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.2
  * ---------------------------------------------------------------------------
  * Swaps the active mod for a game by MOVING folders between a central
  * per-title mod repository and the game's "active" location:
@@ -1202,6 +1202,50 @@ static bool tidyLooseMods(const GameProfile &gp, Status *st)
 }
 
 // ---------------------------------------------------------------------------
+// Game launching. Finds which media the title is installed on (by probing
+// its icon file, same as the name lookup) and asks APT to jump to it. The
+// actual jump happens once we fall out of the main loop and clean up.
+// ---------------------------------------------------------------------------
+static bool installedMedia(const std::string &titleIdHex, FS_MediaType *out)
+{
+    const u64 tid = strtoull(titleIdHex.c_str(), NULL, 16);
+    if (tid == 0) return false;
+
+    FS_MediaType order[3] = { MEDIATYPE_SD, MEDIATYPE_GAME_CARD,
+                              MEDIATYPE_NAND };
+    for (int m = 0; m < 3; ++m) {
+        if (order[m] == MEDIATYPE_GAME_CARD) {
+            bool in = false;
+            if (R_FAILED(FSUSER_CardSlotIsInserted(&in)) || !in) continue;
+        }
+        u32 archPath[4] = { (u32)(tid & 0xFFFFFFFF), (u32)(tid >> 32),
+                            (u32)order[m], 0 };
+        u32 filePath[5] = { 0, 0, 2, 0x6E6F6369 /* "icon" */, 0 };
+        FS_Path aPath = { PATH_BINARY, sizeof(archPath), archPath };
+        FS_Path fPath = { PATH_BINARY, sizeof(filePath), filePath };
+        Handle f;
+        if (R_SUCCEEDED(FSUSER_OpenFileDirectly(&f,
+                            ARCHIVE_SAVEDATA_AND_CONTENT, aPath, fPath,
+                            FS_OPEN_READ, 0))) {
+            FSFILE_Close(f);
+            *out = order[m];
+            return true;
+        }
+    }
+    return false;
+}
+
+static Result doGameJump(const std::string &titleIdHex, FS_MediaType media)
+{
+    const u64 tid = strtoull(titleIdHex.c_str(), NULL, 16);
+    u8 param[0x300] = {0};
+    u8 hmac[0x20]   = {0};
+    Result rc = APT_PrepareToDoApplicationJump(0, tid, media);
+    if (R_FAILED(rc)) return rc;
+    return APT_DoApplicationJump(param, sizeof(param), hmac);
+}
+
+// ---------------------------------------------------------------------------
 // Settings (theme persistence)
 // ---------------------------------------------------------------------------
 static void loadSettings()
@@ -1485,7 +1529,7 @@ static void drawTopHeader(const char *screenTitle)
     if (lvl)
         C2D_DrawRectSolid(bx + 1, by + 1, 0.5f, 16.0f * lvl / 5.0f, 7, fill);
 
-    drawTextRight(364, 11, 0.42f, T.muted, "3DS Mod Manager v3.1");
+    drawTextRight(364, 11, 0.42f, T.muted, "3DS Mod Manager v3.2");
 }
 
 static void drawTopFooter()
@@ -1533,7 +1577,8 @@ static void drawTopGames(const std::vector<GameProfile> &profiles, int cursor)
     drawText(x, 124, 0.45f, T.info,
              std::to_string(gp.modCount) + (gp.modCount == 1 ? " mod" : " mods"));
 
-    drawText(36, 156, 0.42f, T.muted, "Press " G_A " to manage this game's mods");
+    drawText(36, 156, 0.42f, T.muted,
+             G_A " manage mods    " G_X " play now");
 
     drawTopFooter();
 }
@@ -1730,7 +1775,7 @@ static void drawBottomGames(const std::vector<GameProfile> &profiles, int cursor
                             const Status &st)
 {
     drawBottomChrome("Select a game", cursor, (int)profiles.size(),
-                     G_DPAD " Move  " G_A " Open  SELECT Themes");
+                     G_DPAD " Move  " G_A " Open  " G_X " Play  SELECT Themes");
 
     if (profiles.empty()) {
         drawTextCenter(160, 100, 0.5f, T.muted, "No games found");
@@ -1841,7 +1886,7 @@ int main(int argc, char **argv)
 
     // Flush the SMDH attempt trace for off-device diagnosis.
     if (FILE *lf = fopen(LOOKUP_LOG, "w")) {
-        fprintf(lf, "v3.1 hits=%d lastRc=%08lX\n", g_smdhHits,
+        fprintf(lf, "v3.2 hits=%d lastRc=%08lX\n", g_smdhHits,
                 (unsigned long)g_smdhLastRc);
         fputs(g_smdhLog.c_str(), lf);
         fclose(lf);
@@ -1867,7 +1912,11 @@ int main(int argc, char **argv)
     }
 
     // Quit fade: -1 = running; >= 0 counts up to 1 while fading to black.
-    float quitT = -1.0f;
+    // If jumpTid is set when the fade completes, we jump to that title
+    // instead of just exiting.
+    float        quitT = -1.0f;
+    std::string  jumpTid;
+    FS_MediaType jumpMedia = MEDIATYPE_SD;
 
     while (aptMainLoop()) {
         hidScanInput();
@@ -1912,6 +1961,17 @@ int main(int argc, char **argv)
                 status    = { "", SK_NEUTRAL };
                 g_saltyLoaderOk = ensureSaltyLoader(profiles[selected]);
                 state = ST_MODS;
+            }
+            else if (n > 0 && (kDown & KEY_X)) {
+                // Launch the highlighted game (fade out, then APT jump).
+                const GameProfile &gp = profiles[gameCursor];
+                if (installedMedia(gp.titleId, &jumpMedia)) {
+                    jumpTid = gp.titleId;
+                    quitT   = 0.0f;
+                    status  = { "Launching " + gp.title + "...", SK_OK };
+                } else {
+                    status  = { "Not installed - can't launch.", SK_WARN };
+                }
             }
         }
         else { // ST_MODS
@@ -2010,8 +2070,11 @@ int main(int argc, char **argv)
 
         C3D_FrameEnd(0);
 
-        if (quitT >= 1.0f)
+        if (quitT >= 1.0f) {
+            if (!jumpTid.empty())
+                doGameJump(jumpTid, jumpMedia);   // takes effect after exit
             break;
+        }
     }
 
     C2D_TextBufDelete(g_textBuf);
