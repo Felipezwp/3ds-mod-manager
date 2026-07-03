@@ -39,6 +39,8 @@
 
 #include <citro2d.h>
 #include <3ds.h>
+#include <curl/curl.h>    // self-updater transport (TLS via mbedTLS)
+#include <malloc.h>       // memalign (soc:U buffer)
 #include <dirent.h>       // POSIX directory iteration (opendir/readdir)
 #include <sys/stat.h>     // mkdir
 #include <unistd.h>       // rmdir
@@ -55,7 +57,7 @@
 
 // Single source of truth for the app version (shown in the header, stamped
 // into the lookup log, and compared against GitHub release tags).
-#define APP_VER "3.4.1"
+#define APP_VER "3.4.2"
 
 // ---------------------------------------------------------------------------
 // Locations
@@ -1285,49 +1287,47 @@ static void updFail(const char *stage, Result rc)
 }
 
 // GET with redirect following; appends the body to `out`.
+// The 3DS http/ssl sysmodules can't negotiate modern TLS (GitHub requires
+// >= 1.2; httpc dies with D8A0A03C), so networking goes through libcurl +
+// mbedTLS over soc:U sockets instead - TLS runs in-process.
+static size_t curlWrite(char *data, size_t sz, size_t n, void *ud)
+{
+    std::vector<u8> *out = (std::vector<u8> *)ud;
+    out->insert(out->end(), (u8 *)data, (u8 *)data + sz * n);
+    return sz * n;
+}
+
+static int curlProgress(void *, curl_off_t dltotal, curl_off_t dlnow,
+                        curl_off_t, curl_off_t)
+{
+    if (dltotal > 0) g_updPct = (int)(dlnow * 100 / dltotal);
+    return 0;
+}
+
 static Result httpGet(const std::string &url, std::vector<u8> &out,
                       bool trackPct)
 {
-    std::string cur = url;
-    std::vector<u8> chunk(0x20000);
-    for (int redir = 0; redir < 6; ++redir) {
-        httpcContext ctx;
-        Result rc = httpcOpenContext(&ctx, HTTPC_METHOD_GET, cur.c_str(), 1);
-        if (R_FAILED(rc)) return rc;
-        httpcSetSSLOpt(&ctx, SSLCOPT_DisableVerify); // 3DS root store is ancient
-        httpcAddRequestHeaderField(&ctx, "User-Agent", "3dsmods/" APP_VER);
-        rc = httpcBeginRequest(&ctx);
-        u32 status = 0;
-        if (R_SUCCEEDED(rc)) rc = httpcGetResponseStatusCode(&ctx, &status);
-        if (R_FAILED(rc)) { httpcCloseContext(&ctx); return rc; }
-
-        if (status >= 301 && status <= 308) {
-            char loc[1024];
-            rc = httpcGetResponseHeader(&ctx, "Location", loc, sizeof(loc));
-            httpcCloseContext(&ctx);
-            if (R_FAILED(rc)) return rc;
-            cur = loc;
-            continue;
-        }
-        if (status != 200) {
-            httpcCloseContext(&ctx);
-            return MAKERESULT(RL_PERMANENT, RS_INVALIDSTATE, RM_APPLICATION,
-                              status & 0x3FF);   // surface the HTTP status
-        }
-
-        u32 total = 0;
-        httpcGetDownloadSizeState(&ctx, NULL, &total);
-        do {
-            u32 got = 0;
-            rc = httpcDownloadData(&ctx, chunk.data(), chunk.size(), &got);
-            out.insert(out.end(), chunk.begin(), chunk.begin() + got);
-            if (trackPct && total)
-                g_updPct = (int)((u64)out.size() * 100 / total);
-        } while (rc == (Result)HTTPC_RESULTCODE_DOWNLOADPENDING);
-        httpcCloseContext(&ctx);
-        return rc;
+    CURL *c = curl_easy_init();
+    if (!c) return -1;
+    curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(c, CURLOPT_MAXREDIRS, 8L);
+    curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);   // no CA bundle on 3DS
+    curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 0L);
+    curl_easy_setopt(c, CURLOPT_USERAGENT, "3dsmods/" APP_VER);
+    curl_easy_setopt(c, CURLOPT_FAILONERROR, 1L);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 15L);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curlWrite);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &out);
+    if (trackPct) {
+        curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, curlProgress);
     }
-    return -1;
+    const CURLcode cc = curl_easy_perform(c);
+    curl_easy_cleanup(c);
+    if (cc == CURLE_OK) return 0;
+    // Surface the CURLcode in the description bits for updFail's log line.
+    return MAKERESULT(RL_PERMANENT, RS_INTERNAL, RM_APPLICATION, (int)cc);
 }
 
 // "v3.4.1" -> {3,4,1}; missing fields are 0.
@@ -2132,7 +2132,10 @@ int main(int argc, char **argv)
     gfxInitDefault();
     ptmuInit();     // battery level for the header indicator
     sndInit();      // UI blips (silent if no dspfirm.cdc is dumped)
-    httpcInit(0);   // self-updater: GitHub API + download
+    // Self-updater networking: curl over soc:U (see httpGet for why).
+    static u32 *socBuf = (u32 *)memalign(0x1000, 0x100000);
+    if (socBuf) socInit(socBuf, 0x100000);
+    curl_global_init(CURL_GLOBAL_DEFAULT);
     amInit();       // self-updater: CIA install
     C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
     C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
@@ -2506,7 +2509,8 @@ int main(int argc, char **argv)
     C2D_Fini();
     C3D_Fini();
     amExit();
-    httpcExit();
+    curl_global_cleanup();
+    socExit();
     sndExit();
     ptmuExit();
     gfxExit();

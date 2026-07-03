@@ -221,7 +221,7 @@ AccessControlInfo:
    - ac:u
    - ptm:u    # battery level for the header indicator
    - dsp::DSP # ndsp UI sounds
-   - http:C   # self-updater: GitHub releases API + CIA download
+   - soc:U    # self-updater: curl/mbedTLS sockets (httpc can't do TLS 1.2)
    - am:net   # self-updater: CIA install
 
 SystemControlInfo:

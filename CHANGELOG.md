@@ -4,6 +4,13 @@ All notable changes to the 3DS Mod Manager. Versions before this repo was
 created (v3.0) are reconstructed from session notes — early entries are
 approximate.
 
+## v3.4.2 — 2026-07-03
+
+- Updater networking rewritten on libcurl + mbedTLS over soc:U sockets.
+  The 3DS http/ssl system modules can't negotiate TLS >= 1.2 (GitHub's
+  minimum), which is what killed every check with D8A0A03C — TLS now runs
+  in-process, the same approach Universal-Updater uses.
+
 ## v3.4.1 — 2026-07-03
 
 - Updater failures now report the failing stage and exact result code in

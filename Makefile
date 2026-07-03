@@ -35,7 +35,7 @@ APP_UNIQUE_ID		:=	0x5BD37
 # TMD title version: major<<10 | minor<<4 | micro. Bump on every release --
 # the HOME menu caches title icons and only refreshes them when an install
 # registers as an update (version increased).
-APP_VERSION			:=	3137	# 3.4.1
+APP_VERSION			:=	3138	# 3.4.2
 
 # Banner / icon assets used by makerom when building the CIA.
 ICON			:=	$(CURDIR)/icon.png
@@ -60,13 +60,13 @@ ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=3dsx.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
 # citro2d/citro3d for GPU-rendered UI; order matters (2d -> 3d -> ctru).
-LIBS	:= -lcitro2d -lcitro3d -lctru -lm
+LIBS	:= -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz -lcitro2d -lcitro3d -lctru -lm
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing
 # include and lib
 #---------------------------------------------------------------------------------
-LIBDIRS	:= $(CTRULIB)
+LIBDIRS	:= $(PORTLIBS) $(CTRULIB)
 
 
 #---------------------------------------------------------------------------------
