@@ -4,6 +4,16 @@ All notable changes to the 3DS Mod Manager. Versions before this repo was
 created (v3.0) are reconstructed from session notes — early entries are
 approximate.
 
+## v3.3 — 2026-07-03
+
+- **Touchscreen support**: tap a row to highlight it, tap it again to
+  open/activate; tap the `<` corner of the header to go back; theme picker
+  fully tappable (live preview on tap)
+- **UI sounds** via ndsp: synthesized move/confirm/back/error blips (no
+  audio assets; needs a dumped dspfirm.cdc, silently disabled otherwise)
+- L / R cycle themes from any screen
+- SD free space shown in the top-screen footer
+
 ## v3.2.2 — 2026-07-03
 
 - Fix false "Name lookup failed" warning on every warm boot: the SD cache

@@ -211,6 +211,7 @@ AccessControlInfo:
    - APT:U
    - ac:u
    - ptm:u    # battery level for the header indicator
+   - dsp::DSP # ndsp UI sounds
 
 SystemControlInfo:
   SaveDataSize: 0KB

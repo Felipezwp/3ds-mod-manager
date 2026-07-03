@@ -1,5 +1,5 @@
 /*
- * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.2.2
+ * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.3
  * ---------------------------------------------------------------------------
  * Swaps the active mod for a game by MOVING folders between a central
  * per-title mod repository and the game's "active" location:
@@ -1467,6 +1467,81 @@ static void drawCard(float x, float y, float w, float h)
 }
 
 // ---------------------------------------------------------------------------
+// UI sounds (ndsp). Blips are synthesized at boot - square waves with a
+// frequency sweep and exponential decay - so no audio assets are shipped.
+// Requires a dumped DSP firmware (sdmc:/3ds/dspfirm.cdc); if ndspInit fails
+// the app simply stays silent.
+// ---------------------------------------------------------------------------
+enum Snd { SND_MOVE, SND_CONFIRM, SND_BACK, SND_ERROR, SND_COUNT };
+
+static bool        g_ndspUp = false;
+static bool        g_sndOk  = false;
+static s16        *g_sndData[SND_COUNT] = { NULL };
+static ndspWaveBuf g_sndBuf[SND_COUNT];
+
+static s16 *synthBlip(float f0, float f1, float dur, float vol, u32 *outN)
+{
+    const int n = (int)(32000 * dur);
+    s16 *buf = (s16 *)linearAlloc(n * sizeof(s16));
+    if (!buf) return NULL;
+    float phase = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        const float t = (float)i / n;
+        phase += (f0 + (f1 - f0) * t) / 32000.0f;
+        const float env = expf(-t * 6.0f) * (i < 64 ? i / 64.0f : 1.0f);
+        const float sq  = (phase - (int)phase) < 0.5f ? 1.0f : -1.0f;
+        buf[i] = (s16)(sq * env * vol * 32767.0f);
+    }
+    *outN = (u32)n;
+    return buf;
+}
+
+static void sndInit()
+{
+    if (R_FAILED(ndspInit())) return;   // no dspfirm.cdc -> silent app
+    g_ndspUp = true;
+    ndspSetOutputMode(NDSP_OUTPUT_STEREO);
+    ndspChnSetInterp(0, NDSP_INTERP_LINEAR);
+    ndspChnSetRate(0, 32000);
+    ndspChnSetFormat(0, NDSP_FORMAT_MONO_PCM16);
+    float mix[12] = { 1.0f, 1.0f };
+    ndspChnSetMix(0, mix);
+
+    static const struct { float f0, f1, dur, vol; } SPEC[SND_COUNT] = {
+        { 1560.0f, 1560.0f, 0.045f, 0.16f },   // MOVE: short tick
+        {  880.0f, 1760.0f, 0.120f, 0.22f },   // CONFIRM: rising chirp
+        {  990.0f,  495.0f, 0.100f, 0.20f },   // BACK: falling chirp
+        {  220.0f,  180.0f, 0.160f, 0.25f },   // ERROR: low buzz
+    };
+    for (int i = 0; i < SND_COUNT; ++i) {
+        u32 n = 0;
+        g_sndData[i] = synthBlip(SPEC[i].f0, SPEC[i].f1, SPEC[i].dur,
+                                 SPEC[i].vol, &n);
+        if (!g_sndData[i]) return;
+        memset(&g_sndBuf[i], 0, sizeof(ndspWaveBuf));
+        g_sndBuf[i].data_vaddr = g_sndData[i];
+        g_sndBuf[i].nsamples   = n;
+        DSP_FlushDataCache(g_sndData[i], n * sizeof(s16));
+    }
+    g_sndOk = true;
+}
+
+static void sndPlay(Snd s)
+{
+    if (!g_sndOk) return;
+    ndspChnWaveBufClear(0);   // a new blip cuts the previous one
+    g_sndBuf[s].status = NDSP_WBUF_FREE;
+    ndspChnWaveBufAdd(0, &g_sndBuf[s]);
+}
+
+static void sndExit()
+{
+    if (g_ndspUp) ndspExit();
+    for (int i = 0; i < SND_COUNT; ++i)
+        if (g_sndData[i]) linearFree(g_sndData[i]);
+}
+
+// ---------------------------------------------------------------------------
 // Motion. Everything animates by interpolating draw coordinates per frame -
 // the same batched quads render either way, so 60 fps costs nothing extra.
 // ---------------------------------------------------------------------------
@@ -1535,14 +1610,26 @@ static void drawTopHeader(const char *screenTitle)
     if (lvl)
         C2D_DrawRectSolid(bx + 1, by + 1, 0.5f, 16.0f * lvl / 5.0f, 7, fill);
 
-    drawTextRight(364, 11, 0.42f, T.muted, "3DS Mod Manager v3.2.2");
+    drawTextRight(364, 11, 0.42f, T.muted, "3DS Mod Manager v3.3");
 }
 
 static void drawTopFooter()
 {
     C2D_DrawRectSolid(0, 222, 0.5f, 400, 18, T.panel);
-    drawTextCenter(200, 225, 0.4f, T.muted,
-                   "stored: 3ds/3dsmods      smash: saltysd/smash");
+
+    // SD free space, refreshed every ~5 s.
+    static char freeTxt[32] = "";
+    static int  tick = 0;
+    if (tick-- <= 0) {
+        tick = 300;
+        FS_ArchiveResource r;
+        if (R_SUCCEEDED(FSUSER_GetSdmcArchiveResource(&r)))
+            snprintf(freeTxt, sizeof(freeTxt), "SD free: %.1f GB",
+                     (u64)r.freeClusters * r.clusterSize /
+                         (1024.0 * 1024.0 * 1024.0));
+    }
+    drawText(8, 225, 0.4f, T.muted, freeTxt);
+    drawTextRight(392, 225, 0.4f, T.muted, "mods: 3ds/3dsmods");
 }
 
 // Top screen while browsing the game list: live details of the highlighted game.
@@ -1655,11 +1742,16 @@ static void drawTopThemes()
 
 // Bottom-screen chrome: header bar with title + index, hint bar at the bottom.
 static void drawBottomChrome(const std::string &title, int cursor, int total,
-                             const std::string &hints)
+                             const std::string &hints, bool backZone = false)
 {
     hGrad(0, 0, 320, 26, T.panel, withAlpha(T.panel2, 0xEE));
     drawAccentStrip(0, 26, 320, 2);
-    drawText(8, 4, 0.5f, CLR_WHITE, fitText(title, 0.5f, 244));
+    float tx = 8;
+    if (backZone) {   // tappable back corner (matches the touch hit test)
+        drawText(8, 3, 0.52f, T.muted, "<");
+        tx = 22;
+    }
+    drawText(tx, 4, 0.5f, CLR_WHITE, fitText(title, 0.5f, 252 - tx));
     if (total > 0)
         drawPill(314, 5, std::to_string(cursor + 1) + "/" + std::to_string(total),
                  0.36f, T.panel2, T.info, true);
@@ -1814,7 +1906,8 @@ static void drawBottomMods(const GameProfile &gp, const std::vector<ModEntry> &m
                            int cursor, const Status &st)
 {
     drawBottomChrome(gp.title, cursor, (int)mods.size(),
-                     G_A " Use  " G_X " Vanilla  " G_Y " Tidy  " G_B " Back");
+                     G_A " Use  " G_X " Vanilla  " G_Y " Tidy  " G_B " Back",
+                     true);
 
     if (mods.empty()) {
         drawTextCenter(160, 95, 0.5f, T.muted, "No mods found");
@@ -1843,7 +1936,7 @@ static void drawBottomMods(const GameProfile &gp, const std::vector<ModEntry> &m
 static void drawBottomThemes(int cursor)
 {
     drawBottomChrome("Themes", cursor, NUM_THEMES,
-                     G_DPAD " Move  " G_A " Keep  " G_B " Back");
+                     G_DPAD " Move  " G_A " Keep  " G_B " Back", true);
 
     trackSelection(cursor);
     for (int i = 0; i < NUM_THEMES; ++i) {
@@ -1864,6 +1957,7 @@ int main(int argc, char **argv)
 {
     gfxInitDefault();
     ptmuInit();   // battery level for the header indicator
+    sndInit();    // UI blips (silent if no dspfirm.cdc is dumped)
     C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
     C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
     C2D_Prepare();
@@ -1892,7 +1986,7 @@ int main(int argc, char **argv)
 
     // Flush the SMDH attempt trace for off-device diagnosis.
     if (FILE *lf = fopen(LOOKUP_LOG, "w")) {
-        fprintf(lf, "v3.2.2 hits=%d lastRc=%08lX\n", g_smdhHits,
+        fprintf(lf, "v3.3 hits=%d lastRc=%08lX\n", g_smdhHits,
                 (unsigned long)g_smdhLastRc);
         fputs(g_smdhLog.c_str(), lf);
         fclose(lf);
@@ -1935,15 +2029,48 @@ int main(int argc, char **argv)
         if (quitT >= 0)
             kDown = 0;                           // no input while fading
 
+        // Touchscreen: tap a row to highlight it, tap it again to activate.
+        // In sub-screens the header's left edge is a back zone.
+        int  touchRow  = -1;
+        bool touchBack = false;
+        if (kDown & KEY_TOUCH) {
+            touchPosition tp;
+            hidTouchRead(&tp);
+            if (tp.px < 312 && tp.py >= LIST_Y &&
+                tp.py < LIST_Y + LIST_ROWS * ROW_H)
+                touchRow = (int)((tp.py - LIST_Y) / ROW_H);
+            else if (tp.py < 26 && tp.px < 70)
+                touchBack = true;
+        }
+
+        // L / R cycle the theme from anywhere.
+        if (kDown & (KEY_L | KEY_R)) {
+            g_themeIdx = (g_themeIdx +
+                          ((kDown & KEY_R) ? 1 : NUM_THEMES - 1)) % NUM_THEMES;
+            themeCursor = g_themeIdx;
+            saveSettings();
+            status = { std::string("Theme: ") + T.name, SK_OK };
+            sndPlay(SND_MOVE);
+        }
+
+        if (kNav & (KEY_UP | KEY_DOWN))
+            sndPlay(SND_MOVE);
+
         // ------------------------------ input ------------------------------
         if (state == ST_THEMES) {
             if (kNav & KEY_DOWN) themeCursor = (themeCursor + 1) % NUM_THEMES;
             if (kNav & KEY_UP)   themeCursor = (themeCursor - 1 + NUM_THEMES) % NUM_THEMES;
+
+            if (touchRow >= 0 && touchRow < NUM_THEMES) {
+                if (touchRow == themeCursor) touchBack = true;  // keep + close
+                else { themeCursor = touchRow; sndPlay(SND_MOVE); }
+            }
             g_themeIdx = themeCursor;   // live preview
 
-            if (kDown & (KEY_A | KEY_B | KEY_SELECT)) {
+            if ((kDown & (KEY_A | KEY_B | KEY_SELECT)) || touchBack) {
                 saveSettings();
                 state = themeReturn;
+                sndPlay(SND_BACK);
             }
         }
         else if (state == ST_GAMES) {
@@ -1952,12 +2079,24 @@ int main(int argc, char **argv)
             if (n > 0 && (kNav & KEY_DOWN)) gameCursor = (gameCursor + 1) % n;
             if (n > 0 && (kNav & KEY_UP))   gameCursor = (gameCursor - 1 + n) % n;
 
+            bool actOpen = false;
+            if (touchRow >= 0 && n > 0) {
+                int vs, ve;
+                viewport(n, gameCursor, vs, ve);
+                const int idx = vs + touchRow;
+                if (idx < ve) {
+                    if (idx == gameCursor) actOpen = true;
+                    else { gameCursor = idx; sndPlay(SND_MOVE); }
+                }
+            }
+
             if (kDown & KEY_SELECT) {
                 themeReturn = ST_GAMES;
                 themeCursor = g_themeIdx;
                 state = ST_THEMES;
+                sndPlay(SND_CONFIRM);
             }
-            else if (n > 0 && (kDown & KEY_A)) {
+            else if (actOpen || (n > 0 && (kDown & KEY_A))) {
                 selected  = gameCursor;
                 {   // cache hit = instant menu; miss = scan once and keep
                     const std::vector<ModEntry> *c =
@@ -1968,6 +2107,7 @@ int main(int argc, char **argv)
                 status    = { "", SK_NEUTRAL };
                 g_saltyLoaderOk = ensureSaltyLoader(profiles[selected]);
                 state = ST_MODS;
+                sndPlay(SND_CONFIRM);
             }
             else if (n > 0 && (kDown & KEY_X)) {
                 // Launch the highlighted game (fade out, then APT jump).
@@ -1976,15 +2116,28 @@ int main(int argc, char **argv)
                     jumpTid = gp.titleId;
                     quitT   = 0.0f;
                     status  = { "Launching " + gp.title + "...", SK_OK };
+                    sndPlay(SND_CONFIRM);
                 } else {
                     status  = { "Not installed - can't launch.", SK_WARN };
+                    sndPlay(SND_ERROR);
                 }
             }
         }
         else { // ST_MODS
             const GameProfile &gp = profiles[selected];
 
-            if (kDown & KEY_B) {
+            bool actUse = false;
+            if (touchRow >= 0 && !mods.empty()) {
+                int vs, ve;
+                viewport((int)mods.size(), modCursor, vs, ve);
+                const int idx = vs + touchRow;
+                if (idx < ve) {
+                    if (idx == modCursor) actUse = true;
+                    else { modCursor = idx; sndPlay(SND_MOVE); }
+                }
+            }
+
+            if ((kDown & KEY_B) || touchBack) {
                 state      = ST_GAMES;
                 gameCursor = selected;
                 // `mods` is already fresh (rescanned after every action), so
@@ -1992,20 +2145,22 @@ int main(int argc, char **argv)
                 profiles[selected].modCount  = (int)mods.size();
                 profiles[selected].hasActive =
                     !mods.empty() && mods.front().active;
+                sndPlay(SND_BACK);
             }
             else if (kDown & KEY_SELECT) {
                 themeReturn = ST_MODS;
                 themeCursor = g_themeIdx;
                 state = ST_THEMES;
+                sndPlay(SND_CONFIRM);
             }
             else if (kDown & KEY_X) {
-                disableMod(gp, &status);
+                sndPlay(disableMod(gp, &status) ? SND_CONFIRM : SND_ERROR);
                 mods = rescanMods(gp);
                 if (modCursor >= (int)mods.size())
                     modCursor = mods.empty() ? 0 : (int)mods.size() - 1;
             }
             else if (kDown & KEY_Y) {
-                tidyLooseMods(gp, &status);
+                sndPlay(tidyLooseMods(gp, &status) ? SND_CONFIRM : SND_ERROR);
                 mods = rescanMods(gp);
                 if (modCursor >= (int)mods.size())
                     modCursor = mods.empty() ? 0 : (int)mods.size() - 1;
@@ -2015,11 +2170,15 @@ int main(int argc, char **argv)
                     modCursor = (modCursor + 1) % (int)mods.size();
                 if (kNav & KEY_UP)
                     modCursor = (modCursor - 1 + (int)mods.size()) % (int)mods.size();
-                if (kDown & KEY_A) {
+                if (actUse || (kDown & KEY_A)) {
                     // On success the activated mod sorts to the top; follow it
                     // with the cursor so the selection tracks what you just did.
-                    if (activateMod(gp, mods[modCursor], &status))
+                    if (activateMod(gp, mods[modCursor], &status)) {
                         modCursor = 0;
+                        sndPlay(SND_CONFIRM);
+                    } else {
+                        sndPlay(SND_ERROR);
+                    }
                     mods = rescanMods(gp);
                     if (modCursor >= (int)mods.size())
                         modCursor = mods.empty() ? 0 : (int)mods.size() - 1;
@@ -2093,6 +2252,7 @@ int main(int argc, char **argv)
     C2D_TextBufDelete(g_textBuf);
     C2D_Fini();
     C3D_Fini();
+    sndExit();
     ptmuExit();
     gfxExit();
     return 0;
