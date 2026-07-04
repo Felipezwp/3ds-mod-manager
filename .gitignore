@@ -10,3 +10,5 @@ build/
 *.bak
 claude-history/
 .claude/
+keys/
+*.sig

@@ -1,5 +1,5 @@
 /*
- * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.8
+ * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.9
  * ---------------------------------------------------------------------------
  * Swaps the active mod for a game by MOVING folders between a central
  * per-title mod repository and the game's "active" location:
@@ -41,6 +41,8 @@
 #include <3ds.h>
 #include <curl/curl.h>    // self-updater transport (TLS via mbedTLS)
 #include <malloc.h>       // memalign (soc:U buffer)
+#include <mbedtls/pk.h>      // update signature verification
+#include <mbedtls/sha256.h>
 #include <dirent.h>       // POSIX directory iteration (opendir/readdir)
 #include <sys/stat.h>     // mkdir
 #include <unistd.h>       // rmdir
@@ -57,7 +59,7 @@
 
 // Single source of truth for the app version (shown in the header, stamped
 // into the lookup log, and compared against GitHub release tags).
-#define APP_VER "3.8.3"
+#define APP_VER "3.9.0"
 
 // ---------------------------------------------------------------------------
 // Locations
@@ -183,6 +185,60 @@ static const Theme THEMES[] = {
       RGB8(0xFF,0x3B,0x30), RGB8(0xFF,0x7A,0x6E), RGB8(0xFF,0xB3,0xAB),
       RGB8(0x6E,0x14,0x10), RGB8(0x8F,0x1E,0x16),
       RGB8(0xFF,0xD9,0xD4), RGB8(0x8F,0x5B,0x55) },
+    { "Dracula",
+      RGB8(0x1A,0x1B,0x23), RGB8(0x2B,0x2D,0x3F),
+      RGBA8C(0x28,0x2A,0x36,0xEE), RGB8(0x34,0x36,0x4A),
+      RGB8(0xBD,0x93,0xF9), RGB8(0xFF,0x79,0xC6), RGB8(0x8B,0xE9,0xFD),
+      RGB8(0x44,0x47,0x5A), RGB8(0x5A,0x4E,0x8C),
+      RGB8(0xF8,0xF8,0xF2), RGB8(0x62,0x72,0xA4) },
+    { "Nord",
+      RGB8(0x22,0x26,0x2F), RGB8(0x3B,0x42,0x52),
+      RGBA8C(0x2E,0x34,0x40,0xEE), RGB8(0x3B,0x42,0x52),
+      RGB8(0x88,0xC0,0xD0), RGB8(0x81,0xA1,0xC1), RGB8(0xA3,0xBE,0x8C),
+      RGB8(0x4C,0x56,0x6A), RGB8(0x5E,0x81,0xAC),
+      RGB8(0xEC,0xEF,0xF4), RGB8(0x7B,0x88,0xA1) },
+    { "Gruvbox",
+      RGB8(0x1D,0x20,0x21), RGB8(0x3C,0x38,0x36),
+      RGBA8C(0x28,0x28,0x28,0xEE), RGB8(0x3C,0x38,0x36),
+      RGB8(0xFE,0x80,0x19), RGB8(0xFA,0xBD,0x2F), RGB8(0xB8,0xBB,0x26),
+      RGB8(0x79,0x43,0x0E), RGB8(0x9D,0x6A,0x1E),
+      RGB8(0xEB,0xDB,0xB2), RGB8(0x92,0x83,0x74) },
+    { "Monokai",
+      RGB8(0x1E,0x1F,0x1C), RGB8(0x33,0x34,0x2E),
+      RGBA8C(0x27,0x28,0x22,0xEE), RGB8(0x3E,0x3D,0x32),
+      RGB8(0xF9,0x26,0x72), RGB8(0xA6,0xE2,0x2E), RGB8(0xFD,0x97,0x1F),
+      RGB8(0x6E,0x1E,0x3C), RGB8(0x4E,0x5A,0x1E),
+      RGB8(0xF8,0xF8,0xF2), RGB8(0x75,0x71,0x5E) },
+    { "Cyberpunk",
+      RGB8(0x0A,0x0A,0x12), RGB8(0x1A,0x10,0x30),
+      RGBA8C(0x16,0x16,0x2A,0xEE), RGB8(0x23,0x23,0x42),
+      RGB8(0xFC,0xEE,0x0A), RGB8(0x00,0xF0,0xFF), RGB8(0xFF,0x00,0x3C),
+      RGB8(0x5A,0x5A,0x08), RGB8(0x08,0x50,0x5A),
+      RGB8(0xF0,0xF0,0xE8), RGB8(0x78,0x78,0x90) },
+    { "Gameboy",
+      RGB8(0x0F,0x1B,0x0D), RGB8(0x1E,0x3A,0x1A),
+      RGBA8C(0x1B,0x33,0x17,0xEE), RGB8(0x2A,0x4A,0x24),
+      RGB8(0x8B,0xAC,0x0F), RGB8(0x9B,0xBC,0x0F), RGB8(0x30,0x62,0x30),
+      RGB8(0x2E,0x5C,0x28), RGB8(0x3E,0x70,0x30),
+      RGB8(0xD8,0xE8,0xC0), RGB8(0x6E,0x8A,0x5E) },
+    { "Amber",
+      RGB8(0x10,0x0A,0x02), RGB8(0x24,0x15,0x05),
+      RGBA8C(0x1E,0x12,0x04,0xEE), RGB8(0x2E,0x1E,0x08),
+      RGB8(0xFF,0xB0,0x00), RGB8(0xFF,0xCC,0x55), RGB8(0xCC,0x84,0x00),
+      RGB8(0x6E,0x4A,0x08), RGB8(0x8A,0x5E,0x10),
+      RGB8(0xFF,0xE0,0xA8), RGB8(0x8F,0x70,0x40) },
+    { "Lavender",
+      RGB8(0x19,0x15,0x27), RGB8(0x2E,0x25,0x47),
+      RGBA8C(0x27,0x20,0x40,0xEE), RGB8(0x36,0x2D,0x54),
+      RGB8(0xB7,0xA8,0xF7), RGB8(0xD6,0xBB,0xFB), RGB8(0x9B,0xB5,0xF7),
+      RGB8(0x4A,0x3E,0x7A), RGB8(0x5C,0x4A,0x8F),
+      RGB8(0xE8,0xE2,0xF7), RGB8(0x8A,0x7F,0xA8) },
+    { "Coffee",
+      RGB8(0x17,0x10,0x08), RGB8(0x2E,0x21,0x14),
+      RGBA8C(0x26,0x1B,0x10,0xEE), RGB8(0x38,0x2A,0x1A),
+      RGB8(0xC8,0x9F,0x70), RGB8(0xE8,0xCB,0xA8), RGB8(0xA0,0x71,0x4A),
+      RGB8(0x5E,0x45,0x2A), RGB8(0x74,0x56,0x3A),
+      RGB8(0xEF,0xE2,0xD0), RGB8(0x9A,0x82,0x5F) },
 };
 static const int NUM_THEMES = (int)(sizeof(THEMES) / sizeof(THEMES[0]));
 static int g_themeIdx = 0;
@@ -1517,6 +1573,41 @@ static Result installCia(const std::vector<u8> &cia, const char **stage)
     return AM_FinishCiaInstall(h);
 }
 
+// ---------------------------------------------------------------------------
+// Update authenticity. TLS verification is off (the 3DS has no usable CA
+// store), so a network man-in-the-middle could otherwise feed us a hostile
+// CIA that we'd happily install. Every release therefore ships an RSA-2048
+// SHA-256 signature (<asset>.sig) made with the maintainer's private key;
+// the matching public key is baked in here and downloads that don't verify
+// are refused. Unsigned releases no longer install.
+// ---------------------------------------------------------------------------
+static const char UPDATE_PUBKEY[] =
+"-----BEGIN PUBLIC KEY-----\n"
+"MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtbueUyWxFbTklknuUSAo\n"
+"v63/FF/3kklAuawaoIn7z2QGf9ZANrV85Mj+Byf7wLBiDIbOKJE0jb02n+8X0dE7\n"
+"k7Vk3j3itEg7CekqbvLAJ+1pBMsCdxs/mpMSZ8Xq1LtVdNF0JJN36nQNQ+tbY1Mi\n"
+"WvyM5N6m0TTrg6mDh/7Ggs4Sqgpr3kvoig4QUa491DcQQQdeTuySuSKVkvucK5cv\n"
+"z0r0XqN2R+pCfg6+apraKPFJwVkNRLDR63QnmHCveXRDPX/4xQTIpJyfGTji9DgH\n"
+"+oel59uy63i78vEzfKc+8VHT+76IXWQ3r1Ah4afhdvJXwleD5Gx/NeHZt0L8oMN+\n"
+"XQIDAQAB\n"
+"-----END PUBLIC KEY-----\n";
+
+static bool verifySignature(const std::vector<u8> &data,
+                            const std::vector<u8> &sig)
+{
+    unsigned char hash[32];
+    mbedtls_sha256(data.data(), data.size(), hash, 0);
+    mbedtls_pk_context pk;
+    mbedtls_pk_init(&pk);
+    bool ok = false;
+    if (mbedtls_pk_parse_public_key(&pk,
+            (const unsigned char *)UPDATE_PUBKEY, sizeof(UPDATE_PUBKEY)) == 0)
+        ok = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, hash, sizeof(hash),
+                               sig.data(), sig.size()) == 0;
+    mbedtls_pk_free(&pk);
+    return ok;
+}
+
 static bool g_netUp = false;   // soc + curl brought up on first check
 
 static void updWorker(void *)
@@ -1548,19 +1639,23 @@ static void updWorker(void *)
     // The silent boot check stops here: announce, never install unasked.
     if (g_updSilent) { g_updState = UPD_AVAILABLE; return; }
 
-    // Matching release asset: .3dsx when we ARE a 3dsx, .cia otherwise.
-    const std::string ext = g_is3dsx ? ".3dsx" : ".cia";
-    std::string url;
+    // Matching release assets: the binary (.3dsx when we ARE a 3dsx, .cia
+    // otherwise) and its mandatory detached signature (<asset>.sig).
+    const std::string ext    = g_is3dsx ? ".3dsx" : ".cia";
+    const std::string sigExt = ext + ".sig";
+    std::string url, sigUrl;
     for (size_t p = 0; (p = js.find("\"browser_download_url\":\"", p))
                        != std::string::npos; ++p) {
         std::string u = jsonStr(js, "browser_download_url", p);
-        if (u.size() > ext.size() &&
-            u.compare(u.size() - ext.size(), ext.size(), ext) == 0) {
+        if (u.size() > sigExt.size() &&
+            u.compare(u.size() - sigExt.size(), sigExt.size(), sigExt) == 0)
+            sigUrl = u;
+        else if (u.size() > ext.size() &&
+                 u.compare(u.size() - ext.size(), ext.size(), ext) == 0)
             url = u;
-            break;
-        }
     }
-    if (url.empty()) { updFail("asset", 0); return; }
+    if (url.empty())    { updFail("asset", 0); return; }
+    if (sigUrl.empty()) { updFail("no-sig", 0); return; }
 
     g_updPct   = 0;
     g_updState = UPD_DOWNLOADING;
@@ -1569,6 +1664,13 @@ static void updWorker(void *)
     if (R_FAILED(rc) || cia.size() < 0x4000) { updFail("dl", rc); return; }
     updLog("dl ok %u bytes hdr=%02X%02X%02X%02X", (unsigned)cia.size(),
            cia[0], cia[1], cia[2], cia[3]);
+
+    // Authenticity gate: refuse anything the release key didn't sign.
+    std::vector<u8> sig;
+    rc = httpGet(sigUrl, sig, false);
+    if (R_FAILED(rc) || sig.size() < 64) { updFail("sig-dl", rc); return; }
+    if (!verifySignature(cia, sig))      { updFail("BAD-SIG", 0); return; }
+    updLog("signature ok");
 
     g_updState = UPD_INSTALLING;
     const char *stage = "install";

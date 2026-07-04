@@ -4,6 +4,17 @@ All notable changes to the 3DS Mod Manager. Versions before this repo was
 created (v3.0) are reconstructed from session notes — early entries are
 approximate.
 
+## v3.9 — 2026-07-04
+
+- **Signed updates.** TLS verification is off on the 3DS (no usable CA
+  store), so a network man-in-the-middle could previously have fed the
+  updater a hostile CIA. Every release now ships an RSA-2048/SHA-256
+  detached signature; the public key is baked into the app and downloads
+  that don't verify are refused ("BAD-SIG"). Unsigned releases no longer
+  install.
+- **Nine new themes** — Dracula, Nord, Gruvbox, Monokai, Cyberpunk,
+  Gameboy, Amber, Lavender, Coffee — for a round 20.
+
 ## v3.8.3 — 2026-07-04
 
 - Internal refactor, zero behavior change: list navigation (wrap / page
