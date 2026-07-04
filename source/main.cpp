@@ -57,7 +57,7 @@
 
 // Single source of truth for the app version (shown in the header, stamped
 // into the lookup log, and compared against GitHub release tags).
-#define APP_VER "3.8.2"
+#define APP_VER "3.8.3"
 
 // ---------------------------------------------------------------------------
 // Locations
@@ -806,8 +806,19 @@ static void saveIconCache(const std::string &tid, const u16 *px)
     }
 }
 
-// Read a title's real name from its installed SMDH (icon) metadata, the same
-// way FBI does: open the "icon" file of the title's content archive directly.
+// Open a title's SMDH "icon" file on the given media (FBI's technique).
+static Result openTitleIcon(u64 tid, FS_MediaType media, Handle *out)
+{
+    u32 archPath[4] = { (u32)(tid & 0xFFFFFFFF), (u32)(tid >> 32),
+                        (u32)media, 0 };
+    u32 filePath[5] = { 0, 0, 2, 0x6E6F6369 /* "icon" */, 0 };
+    FS_Path aPath = { PATH_BINARY, sizeof(archPath), archPath };
+    FS_Path fPath = { PATH_BINARY, sizeof(filePath), filePath };
+    return FSUSER_OpenFileDirectly(out, ARCHIVE_SAVEDATA_AND_CONTENT,
+                                   aPath, fPath, FS_OPEN_READ, 0);
+}
+
+// Read a title's real name from its installed SMDH (icon) metadata.
 // Tries SD, then NAND (system titles), then the game card. "" if not found.
 // A successful read also feeds the GPU icon cache and both SD caches.
 static std::string smdhGameName(const std::string &titleIdHex)
@@ -837,15 +848,8 @@ static std::string smdhGameName(const std::string &titleIdHex)
             bool in = false;   // don't probe an empty card slot
             if (R_FAILED(FSUSER_CardSlotIsInserted(&in)) || !in) continue;
         }
-        u32 archPath[4] = { (u32)(tid & 0xFFFFFFFF), (u32)(tid >> 32),
-                            (u32)MEDIA[m], 0 };
-        u32 filePath[5] = { 0, 0, 2, 0x6E6F6369 /* "icon" */, 0 };
-        FS_Path aPath = { PATH_BINARY, sizeof(archPath), archPath };
-        FS_Path fPath = { PATH_BINARY, sizeof(filePath), filePath };
-
         Handle f;
-        Result rc = FSUSER_OpenFileDirectly(&f, ARCHIVE_SAVEDATA_AND_CONTENT,
-                                            aPath, fPath, FS_OPEN_READ, 0);
+        Result rc = openTitleIcon(tid, MEDIA[m], &f);
         if (R_FAILED(rc)) {
             g_smdhLastRc = rc;
             smdhLogf("%s m%d open rc=%08lX\n", titleIdHex.c_str(),
@@ -1324,15 +1328,8 @@ static bool installedMedia(const std::string &titleIdHex, FS_MediaType *out)
             bool in = false;
             if (R_FAILED(FSUSER_CardSlotIsInserted(&in)) || !in) continue;
         }
-        u32 archPath[4] = { (u32)(tid & 0xFFFFFFFF), (u32)(tid >> 32),
-                            (u32)order[m], 0 };
-        u32 filePath[5] = { 0, 0, 2, 0x6E6F6369 /* "icon" */, 0 };
-        FS_Path aPath = { PATH_BINARY, sizeof(archPath), archPath };
-        FS_Path fPath = { PATH_BINARY, sizeof(filePath), filePath };
         Handle f;
-        if (R_SUCCEEDED(FSUSER_OpenFileDirectly(&f,
-                            ARCHIVE_SAVEDATA_AND_CONTENT, aPath, fPath,
-                            FS_OPEN_READ, 0))) {
+        if (R_SUCCEEDED(openTitleIcon(tid, order[m], &f))) {
             FSFILE_Close(f);
             *out = order[m];
             return true;
@@ -2182,6 +2179,26 @@ static void viewport(int total, int cursor, int &start, int &end)
     if (end > total) end = total;
 }
 
+// Shared list navigation: Up/Down wrap one row, Left/Right jump a page,
+// drag rows clamp - one implementation for games, mods and themes.
+// Returns true when the cursor moved (caller plays the tick).
+static bool navList(int &cursor, int n, u32 kNav, int dragRows)
+{
+    if (n <= 0) return false;
+    const int before = cursor;
+    if (kNav & KEY_DOWN) cursor = (cursor + 1) % n;
+    if (kNav & KEY_UP)   cursor = (cursor - 1 + n) % n;
+    int jump = dragRows;
+    if (kNav & KEY_RIGHT) jump += LIST_ROWS;
+    if (kNav & KEY_LEFT)  jump -= LIST_ROWS;
+    if (jump) {
+        cursor += jump;
+        if (cursor < 0)  cursor = 0;
+        if (cursor >= n) cursor = n - 1;
+    }
+    return cursor != before;
+}
+
 // Scrollbar along the right edge of the list area.
 static void drawScrollbar(int total, int start)
 {
@@ -2467,6 +2484,14 @@ int main(int argc, char **argv)
         status = { std::string("Name lookup failed: 0x") + rcbuf, SK_WARN };
     }
 
+    // Refresh the open game's mod list after an action, keeping the cursor
+    // in range (the same three lines used to follow every action).
+    const auto refreshModList = [&](const GameProfile &g) {
+        mods = rescanMods(g);
+        if (modCursor >= (int)mods.size())
+            modCursor = mods.empty() ? 0 : (int)mods.size() - 1;
+    };
+
     // Quit fade: -1 = running; >= 0 counts up to 1 while fading to black.
     // If jumpTid is set when the fade completes, we jump to that title
     // instead of just exiting.
@@ -2540,20 +2565,11 @@ int main(int argc, char **argv)
             sndPlay(SND_MOVE);
         }
 
-        if (kNav & (KEY_UP | KEY_DOWN))
-            sndPlay(SND_MOVE);
 
         // ------------------------------ input ------------------------------
         if (state == ST_THEMES) {
-            if (kNav & KEY_DOWN) themeCursor = (themeCursor + 1) % NUM_THEMES;
-            if (kNav & KEY_UP)   themeCursor = (themeCursor - 1 + NUM_THEMES) % NUM_THEMES;
-
-            if (dragRows) {
-                themeCursor += dragRows;
-                if (themeCursor < 0)           themeCursor = 0;
-                if (themeCursor >= NUM_THEMES) themeCursor = NUM_THEMES - 1;
+            if (navList(themeCursor, NUM_THEMES, kNav, dragRows))
                 sndPlay(SND_MOVE);
-            }
 
             if (touchRow >= 0) {
                 int vs, ve;
@@ -2575,23 +2591,8 @@ int main(int argc, char **argv)
         else if (state == ST_GAMES) {
             const int n = (int)profiles.size();
 
-            if (n > 0 && (kNav & KEY_DOWN)) gameCursor = (gameCursor + 1) % n;
-            if (n > 0 && (kNav & KEY_UP))   gameCursor = (gameCursor - 1 + n) % n;
-
-            // Left/Right jump a whole page - fast travel for big libraries.
-            if (n > 0 && (kNav & (KEY_LEFT | KEY_RIGHT))) {
-                gameCursor += (kNav & KEY_RIGHT) ? LIST_ROWS : -LIST_ROWS;
-                if (gameCursor < 0)  gameCursor = 0;
-                if (gameCursor >= n) gameCursor = n - 1;
+            if (navList(gameCursor, n, kNav, dragRows))
                 sndPlay(SND_MOVE);
-            }
-
-            if (dragRows && n > 0) {
-                gameCursor += dragRows;
-                if (gameCursor < 0)  gameCursor = 0;
-                if (gameCursor >= n) gameCursor = n - 1;
-                sndPlay(SND_MOVE);
-            }
 
             bool actOpen = false;
             if (touchRow >= 0 && n > 0) {
@@ -2644,12 +2645,8 @@ int main(int argc, char **argv)
         else { // ST_MODS
             const GameProfile &gp = profiles[selected];
 
-            if (dragRows && !mods.empty()) {
-                modCursor += dragRows;
-                if (modCursor < 0)                     modCursor = 0;
-                if (modCursor >= (int)mods.size())     modCursor = (int)mods.size() - 1;
+            if (navList(modCursor, (int)mods.size(), kNav, dragRows))
                 sndPlay(SND_MOVE);
-            }
 
             bool actUse = false;
             if (touchRow >= 0 && !mods.empty()) {
@@ -2680,28 +2677,13 @@ int main(int argc, char **argv)
             }
             else if (kDown & KEY_X) {
                 sndPlay(disableMod(gp, &status) ? SND_CONFIRM : SND_ERROR);
-                mods = rescanMods(gp);
-                if (modCursor >= (int)mods.size())
-                    modCursor = mods.empty() ? 0 : (int)mods.size() - 1;
+                refreshModList(gp);
             }
             else if (kDown & KEY_Y) {
                 sndPlay(tidyLooseMods(gp, &status) ? SND_CONFIRM : SND_ERROR);
-                mods = rescanMods(gp);
-                if (modCursor >= (int)mods.size())
-                    modCursor = mods.empty() ? 0 : (int)mods.size() - 1;
+                refreshModList(gp);
             }
             else if (!mods.empty()) {
-                if (kNav & KEY_DOWN)
-                    modCursor = (modCursor + 1) % (int)mods.size();
-                if (kNav & KEY_UP)
-                    modCursor = (modCursor - 1 + (int)mods.size()) % (int)mods.size();
-                if (kNav & (KEY_LEFT | KEY_RIGHT)) {   // page jump
-                    modCursor += (kNav & KEY_RIGHT) ? LIST_ROWS : -LIST_ROWS;
-                    if (modCursor < 0) modCursor = 0;
-                    if (modCursor >= (int)mods.size())
-                        modCursor = (int)mods.size() - 1;
-                    sndPlay(SND_MOVE);
-                }
                 if (actUse || (kDown & KEY_A)) {
                     // On success the activated mod sorts to the top; follow it
                     // with the cursor so the selection tracks what you just did.
@@ -2711,9 +2693,7 @@ int main(int argc, char **argv)
                     } else {
                         sndPlay(SND_ERROR);
                     }
-                    mods = rescanMods(gp);
-                    if (modCursor >= (int)mods.size())
-                        modCursor = mods.empty() ? 0 : (int)mods.size() - 1;
+                    refreshModList(gp);
                 }
             }
         }

@@ -4,6 +4,13 @@ All notable changes to the 3DS Mod Manager. Versions before this repo was
 created (v3.0) are reconstructed from session notes — early entries are
 approximate.
 
+## v3.8.3 — 2026-07-04
+
+- Internal refactor, zero behavior change: list navigation (wrap / page
+  jump / drag clamp), the SMDH icon-file opener, and the post-action mod
+  list refresh each existed in 2-3 copies — now one implementation each.
+  Small bonus: the theme picker gained Left/Right page jump for free.
+
 ## v3.8.2 — 2026-07-04
 
 - Fix the download toast replaying its slide-in animation on every
