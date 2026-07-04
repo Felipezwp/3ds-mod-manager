@@ -57,7 +57,7 @@
 
 // Single source of truth for the app version (shown in the header, stamped
 // into the lookup log, and compared against GitHub release tags).
-#define APP_VER "3.7.0"
+#define APP_VER "3.7.1"
 
 // ---------------------------------------------------------------------------
 // Locations
@@ -759,7 +759,7 @@ static bool loadCachedIcon(const std::string &tid)
     if (iconKnown(tid)) return true;
     FILE *f = fopen(iconCachePath(tid).c_str(), "rb");
     if (!f) return false;
-    static u16 px[48 * 48];
+    static __attribute__((aligned(128))) u16 px[48 * 48];
     const size_t n = fread(px, 1, sizeof(px), f);
     fclose(f);
     if (n != sizeof(px)) return false;
@@ -788,7 +788,9 @@ static std::string smdhGameName(const std::string &titleIdHex)
     // Full SMDH (0x36C0): title blocks for the name plus the 48x48 icon.
     // static: FS rejects IPC read buffers on the app stack with
     // 0xE0C046F9 (InvalidArgument); .bss memory maps fine (FBI uses heap).
-    static struct {
+    // 128-byte alignment lets the ARM9 DMA write straight into the buffer
+    // instead of bouncing through a kernel copy.
+    static __attribute__((aligned(128))) struct {
         u32 magic;             // 'SMDH'
         u16 version, reserved;
         struct { u16 shortDesc[0x40]; u16 longDesc[0x80]; u16 publisher[0x40]; } t[16];
@@ -1445,10 +1447,10 @@ static std::string jsonStr(const std::string &js, const std::string &key,
 
 static Result installCia(const std::vector<u8> &cia, const char **stage)
 {
-    // A half-finished earlier attempt leaves a pending title that can wedge
-    // AM_StartCiaInstall; clearing it is harmless when there is none.
-    AM_DeletePendingTitle(MEDIATYPE_SD, 0x0004000005BD3700ULL);
-
+    // Deliberately NO pending-title cleanup: Universal-Updater's proven
+    // self-update flow installs straight over the running title and then
+    // immediately APT-jumps into it, which is what finalizes the import.
+    // (Deleting pending state here is what wedged self-installed copies.)
     *stage = "am-start";
     Handle h;
     Result rc = AM_StartCiaInstall(MEDIATYPE_SD, &h);
@@ -1458,7 +1460,8 @@ static Result installCia(const std::vector<u8> &cia, const char **stage)
     while (off < cia.size()) {
         const u32 n = (u32)std::min<size_t>(0x10000, cia.size() - off);
         u32 written = 0;
-        rc = FSFILE_Write(h, &written, off, cia.data() + off, n, 0);
+        rc = FSFILE_Write(h, &written, off, cia.data() + off, n,
+                          FS_WRITE_FLUSH);   // U-U parity
         if (R_FAILED(rc)) {
             static char where[24];   // failing offset pinpoints WHAT AM hated
             snprintf(where, sizeof(where), "am-write@%06lX",
@@ -2670,8 +2673,22 @@ int main(int argc, char **argv)
                 status = { "Installing update...", SK_NEUTRAL };
                 break;
             case UPD_DONE:
-                status = { "Updated to " + std::string(g_updTag) +
-                           " - restart the app!", SK_OK };
+                if (g_is3dsx) {
+                    // Can't relaunch a 3dsx by title id - user restarts HBL.
+                    status = { "Updated to " + std::string(g_updTag) +
+                               " - restart the app!", SK_OK };
+                } else {
+                    // Relaunch into the new copy NOW: the APT jump is what
+                    // finalizes the import (Universal-Updater's flow) - a
+                    // manual HOME relaunch leaves it half-committed and the
+                    // NEXT self-update dies at am-write@0.
+                    status  = { "Updated to " + std::string(g_updTag) +
+                                " - restarting...", SK_OK };
+                    jumpTid   = "0004000005BD3700";
+                    jumpMedia = MEDIATYPE_SD;
+                    if (quitT < 0) quitT = 0.0f;
+                }
+                g_updState = UPD_IDLE;
                 break;
             case UPD_UPTODATE:
                 status = { "Up to date (v" APP_VER ").", SK_OK };

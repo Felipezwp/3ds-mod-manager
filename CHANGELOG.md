@@ -4,6 +4,18 @@ All notable changes to the 3DS Mod Manager. Versions before this repo was
 created (v3.0) are reconstructed from session notes — early entries are
 approximate.
 
+## v3.7.1 — 2026-07-03
+
+- **Self-update chain fixed** (the am-write@0 / D8E08027 mystery): after
+  installing over the running title, the import must be finalized by
+  APT-jumping into the new copy immediately — a manual HOME relaunch left
+  it half-committed and the *next* self-update died on its first write.
+  The app now relaunches itself after updating (Universal-Updater's flow);
+  the counterproductive pending-title cleanup is gone and writes use
+  FS_WRITE_FLUSH for full U-U parity.
+- FS read buffers aligned to 128 bytes (ARM9 DMA writes directly, skipping
+  a kernel bounce copy).
+
 ## v3.7 — 2026-07-03
 
 - **Dynamic game presence**: the header strip, top-card glow and selection
