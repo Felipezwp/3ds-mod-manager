@@ -4,6 +4,14 @@ All notable changes to the 3DS Mod Manager. Versions before this repo was
 created (v3.0) are reconstructed from session notes — early entries are
 approximate.
 
+## v3.8 — 2026-07-03
+
+- **Five new themes**: Sakura (blossom pink), Vaporwave (magenta/cyan),
+  Matrix (terminal green), Gilded (gold on black), Virtual (Virtual Boy
+  red) — 11 total. The theme picker now scrolls (viewport + scrollbar,
+  touch-aware).
+- Screenshots added to the README (taken on-device).
+
 ## v3.7.1 — 2026-07-03
 
 - **Self-update chain fixed** (the am-write@0 / D8E08027 mystery): after

@@ -1,5 +1,5 @@
 /*
- * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.7
+ * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.8
  * ---------------------------------------------------------------------------
  * Swaps the active mod for a game by MOVING folders between a central
  * per-title mod repository and the game's "active" location:
@@ -57,7 +57,7 @@
 
 // Single source of truth for the app version (shown in the header, stamped
 // into the lookup log, and compared against GitHub release tags).
-#define APP_VER "3.7.2"
+#define APP_VER "3.8.0"
 
 // ---------------------------------------------------------------------------
 // Locations
@@ -153,6 +153,36 @@ static const Theme THEMES[] = {
       RGB8(0xAA,0xB2,0xC0), RGB8(0x8A,0x93,0xA5), RGB8(0xC9,0xD1,0xDC),
       RGB8(0x3E,0x46,0x54), RGB8(0x4C,0x55,0x68),
       RGB8(0xD5,0xDA,0xE2), RGB8(0x6E,0x76,0x84) },
+    { "Sakura",
+      RGB8(0x1F,0x12,0x18), RGB8(0x3A,0x1E,0x2E),
+      RGBA8C(0x33,0x20,0x2B,0xEE), RGB8(0x47,0x2C,0x3A),
+      RGB8(0xF4,0x8F,0xB1), RGB8(0xC7,0x9B,0xF7), RGB8(0xFF,0xD1,0xDC),
+      RGB8(0x8A,0x3B,0x5E), RGB8(0xA3,0x45,0x67),
+      RGB8(0xF5,0xDE,0xE7), RGB8(0x9C,0x73,0x86) },
+    { "Vaporwave",
+      RGB8(0x14,0x0A,0x24), RGB8(0x2B,0x11,0x52),
+      RGBA8C(0x24,0x15,0x40,0xEE), RGB8(0x37,0x21,0x59),
+      RGB8(0xFF,0x71,0xCE), RGB8(0x01,0xCD,0xFE), RGB8(0xB9,0x67,0xFF),
+      RGB8(0x7A,0x2E,0x8F), RGB8(0x2E,0x4B,0x9E),
+      RGB8(0xE8,0xDF,0xF7), RGB8(0x8B,0x7B,0xA8) },
+    { "Matrix",
+      RGB8(0x05,0x0D,0x06), RGB8(0x0C,0x24,0x10),
+      RGBA8C(0x0E,0x1F,0x12,0xEE), RGB8(0x16,0x30,0x1C),
+      RGB8(0x00,0xE6,0x76), RGB8(0x66,0xFF,0xA6), RGB8(0xB9,0xF6,0xCA),
+      RGB8(0x0F,0x51,0x32), RGB8(0x1B,0x7A,0x4A),
+      RGB8(0xCD,0xEF,0xD8), RGB8(0x5E,0x8A,0x6B) },
+    { "Gilded",
+      RGB8(0x14,0x10,0x07), RGB8(0x2E,0x24,0x10),
+      RGBA8C(0x26,0x20,0x12,0xEE), RGB8(0x3A,0x31,0x1C),
+      RGB8(0xE8,0xC1,0x5A), RGB8(0xF2,0xE4,0xB0), RGB8(0xC9,0x8F,0x3B),
+      RGB8(0x8A,0x6A,0x1F), RGB8(0xA8,0x84,0x2E),
+      RGB8(0xF2,0xE9,0xD4), RGB8(0x9C,0x8B,0x62) },
+    { "Virtual",
+      RGB8(0x0A,0x02,0x02), RGB8(0x1F,0x05,0x05),
+      RGBA8C(0x1C,0x08,0x08,0xEE), RGB8(0x2E,0x0C,0x0C),
+      RGB8(0xFF,0x3B,0x30), RGB8(0xFF,0x7A,0x6E), RGB8(0xFF,0xB3,0xAB),
+      RGB8(0x6E,0x14,0x10), RGB8(0x8F,0x1E,0x16),
+      RGB8(0xFF,0xD9,0xD4), RGB8(0x8F,0x5B,0x55) },
 };
 static const int NUM_THEMES = (int)(sizeof(THEMES) / sizeof(THEMES[0]));
 static int g_themeIdx = 0;
@@ -2298,16 +2328,22 @@ static void drawBottomThemes(int cursor)
     drawBottomChrome("Themes", cursor, NUM_THEMES,
                      G_DPAD " Move  " G_A " Keep  " G_B " Back", true);
 
-    trackSelection(cursor);
-    for (int i = 0; i < NUM_THEMES; ++i) {
-        const float y = LIST_Y + i * ROW_H;
-        drawListRow(i, THEMES[i].name, i == cursor, "", 0);
+    int start, end;
+    viewport(NUM_THEMES, cursor, start, end);
+    trackSelection(cursor - start);
+
+    for (int i = start; i < end; ++i) {
+        const int slot = i - start;
+        const float y  = LIST_Y + slot * ROW_H;
+        drawListRow(slot, THEMES[i].name, i == cursor, "", 0);
         // palette preview dots (accent / secondary / info)
+        const float dx = 4 + rowSlide(slot);
         const float cy = y + ROW_H / 2.0f;
-        C2D_DrawCircleSolid(262, cy, 0.5f, 4.5f, THEMES[i].accent);
-        C2D_DrawCircleSolid(278, cy, 0.5f, 4.5f, THEMES[i].secondary);
-        C2D_DrawCircleSolid(294, cy, 0.5f, 4.5f, THEMES[i].info);
+        C2D_DrawCircleSolid(dx + 258, cy, 0.5f, 4.5f, THEMES[i].accent);
+        C2D_DrawCircleSolid(dx + 274, cy, 0.5f, 4.5f, THEMES[i].secondary);
+        C2D_DrawCircleSolid(dx + 290, cy, 0.5f, 4.5f, THEMES[i].info);
     }
+    drawScrollbar(NUM_THEMES, start);
 }
 
 // ---------------------------------------------------------------------------
@@ -2494,9 +2530,14 @@ int main(int argc, char **argv)
                 sndPlay(SND_MOVE);
             }
 
-            if (touchRow >= 0 && touchRow < NUM_THEMES) {
-                if (touchRow == themeCursor) touchBack = true;  // keep + close
-                else { themeCursor = touchRow; sndPlay(SND_MOVE); }
+            if (touchRow >= 0) {
+                int vs, ve;
+                viewport(NUM_THEMES, themeCursor, vs, ve);
+                const int idx = vs + touchRow;
+                if (idx < ve) {
+                    if (idx == themeCursor) touchBack = true;  // keep + close
+                    else { themeCursor = idx; sndPlay(SND_MOVE); }
+                }
             }
             g_themeIdx = themeCursor;   // live preview
 

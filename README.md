@@ -3,7 +3,15 @@
 A homebrew mod manager for the Nintendo 3DS that hot-swaps game mods on the
 console itself — no PC required after setup. Built with libctru + citro2d.
 
-![version](https://img.shields.io/badge/version-3.0-blue) (private project)
+## Screenshots
+
+| Game view (Crimson theme) | Game list |
+| --- | --- |
+| ![hero](screenshots/hero-crimson.png) | ![list](screenshots/list-crimson.png) |
+
+| Smash mods (Emerald + SaltySD) | Theme picker |
+| --- | --- |
+| ![mods](screenshots/mods-emerald.png) | ![themes](screenshots/themes.png) |
 
 ## What it does
 
