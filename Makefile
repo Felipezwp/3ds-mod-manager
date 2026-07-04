@@ -22,9 +22,9 @@ GFXBUILD	:=	$(BUILD)
 #ROMFS		:=	romfs
 
 # Metadata stored in the SMDH / CIA.
-APP_TITLE		:=	SSB3DS Mod Manager
-APP_DESCRIPTION	:=	LayeredFS mod hot-swapper for Smash 3DS
-APP_AUTHOR		:=	Homebrew
+APP_TITLE		:=	3DS Mod Manager
+APP_DESCRIPTION	:=	Universal LayeredFS + SaltySD mod manager
+APP_AUTHOR		:=	Felipezwp
 
 # Unique title id for the *manager app itself* (NOT the game!). Any unused
 # homebrew id works; 0xFF3FF collided with another installed app, so this
@@ -35,7 +35,7 @@ APP_UNIQUE_ID		:=	0x5BD37
 # TMD title version: major<<10 | minor<<4 | micro. Bump on every release --
 # the HOME menu caches title icons and only refreshes them when an install
 # registers as an update (version increased).
-APP_VERSION			:=	3219	# 3.9.3
+APP_VERSION			:=	4096	# 4.0.0
 
 # Banner / icon assets used by makerom when building the CIA.
 ICON			:=	$(CURDIR)/icon.png

@@ -2,6 +2,7 @@
 
 A homebrew mod manager for the Nintendo 3DS that hot-swaps game mods on the
 console itself — no PC required after setup. Built with libctru + citro2d.
+Works on every model (old/New 3DS/2DS) with Luma3DS. MIT licensed.
 
 ## Screenshots
 
@@ -12,6 +13,24 @@ console itself — no PC required after setup. Built with libctru + citro2d.
 | Smash mods (Emerald + SaltySD) | Theme picker |
 | --- | --- |
 | ![mods](screenshots/mods-emerald.png) | ![themes](screenshots/themes.png) |
+
+## Install (any CFW 3DS, old and New models)
+
+1. Download `3dsmods.cia` from the
+   [latest release](https://github.com/Felipezwp/3ds-mod-manager/releases/latest)
+   and install it with FBI. Requirements: Luma3DS with **game patching
+   enabled** (hold SELECT at boot to check).
+2. From then on the app updates itself: it checks for releases at boot and
+   pressing Y installs them. Updates are RSA-signed and verified on-device
+   before installing.
+3. Optional: UI sounds need your console's dumped DSP firmware
+   (`sdmc:/3ds/dspfirm.cdc`, dump with the DSP1 homebrew) — without it the
+   app simply runs silent.
+
+Mods go in `sdmc:/3ds/3dsmods/<TitleID>/<mod name>/` (the folder is created
+on first run). For Smash, see the SaltySD notes below — the in-app
+**SaltySD loader** entry (bottom of Smash's mod list) lets you pick which
+`code.ips` to use if the default crashes.
 
 ## What it does
 
@@ -83,6 +102,17 @@ On Windows, run make from devkitPro's msys2 shell:
 - The manager keeps a pristine loader at `3ds/3dsmods/<SmashTID>/code.ips`
   and restores `luma/titles/<SmashTID>/code.ips` from it whenever missing.
 - Smash needs update 1.1.7 installed and Luma "Enable game patching" on.
+- USA and EUR Smash are recognized out of the box; other regions (or other
+  SaltySD-based games) can be added by listing their Title IDs, one per
+  line, in `sdmc:/3ds/3dsmods/saltysd.txt`.
+- The **SaltySD loader** entry at the bottom of a SaltySD game's mod list
+  opens a picker of every `code.ips` on the card (repo copy, active mod's,
+  each stored mod's) and installs your choice — the cure for
+  loader/revision mismatches.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
 
 ## Credits
 

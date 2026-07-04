@@ -1,5 +1,5 @@
 /*
- * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.9
+ * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v4.0
  * ---------------------------------------------------------------------------
  * Swaps the active mod for a game by MOVING folders between a central
  * per-title mod repository and the game's "active" location:
@@ -59,7 +59,7 @@
 
 // Single source of truth for the app version (shown in the header, stamped
 // into the lookup log, and compared against GitHub release tags).
-#define APP_VER "3.9.3"
+#define APP_VER "4.0.0"
 
 // ---------------------------------------------------------------------------
 // Locations
@@ -72,9 +72,15 @@ static const char *SETTINGS_TXT = "sdmc:/3ds/3dsmods/settings.txt";
 // SaltySD-managed titles: their active mod lives in a fixed SD folder that the
 // SaltySD code patch reads, NOT in luma/titles. The loader (code.ips) must
 // stay in luma/titles/<TitleID>/ for Luma game patching to apply it.
-static const char *SALTY_TITLE_ID = "00040000000EDF00";  // Super Smash Bros.
+// USA and EUR Smash are built in; more title IDs (other regions / other
+// SaltySD games) can be added one-per-line in sdmc:/3ds/3dsmods/saltysd.txt.
 static const char *SALTY_ACTIVE   = "sdmc:/saltysd/smash";
 static const char *SALTY_PARENT   = "sdmc:/saltysd";
+static const char *SALTY_LIST_TXT = "sdmc:/3ds/3dsmods/saltysd.txt";
+static std::vector<std::string> g_saltyTids = {
+    "00040000000EDF00",   // Super Smash Bros. (USA)
+    "00040000000EE000",   // Super Smash Bros. (EUR)
+};
 
 // Per-folder marker files holding a mod's human-readable name (modname.txt
 // preferred; desc.txt, used by ModMoon, is read as a fallback).
@@ -477,8 +483,9 @@ struct GameProfile {
 struct ModEntry {
     std::string display;  // human-readable name
     std::string path;     // full path of this mod's source folder
-    bool        active;   // occupies the active location right now
-    bool        loose;    // legacy-location folder (luma/titles, ModMoon, ...)
+    bool        active = false; // occupies the active location right now
+    bool        loose  = false; // legacy folder (luma/titles, ModMoon, ...)
+    bool        loader = false; // pseudo-entry: opens the SaltySD loader picker
 };
 
 // A legacy-location folder eligible for Tidy.
@@ -502,7 +509,26 @@ struct Status {
 // in the SaltySD redirect folder.
 static bool isSalty(const GameProfile &gp)
 {
-    return iequals(gp.titleId, SALTY_TITLE_ID);
+    for (const std::string &t : g_saltyTids)
+        if (iequals(gp.titleId, t)) return true;
+    return false;
+}
+
+// Extra SaltySD title IDs from sdmc:/3ds/3dsmods/saltysd.txt (one per line).
+static void loadSaltyList()
+{
+    FILE *f = fopen(SALTY_LIST_TXT, "r");
+    if (!f) return;
+    char line[64];
+    while (fgets(line, sizeof(line), f)) {
+        std::string s = line;
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r' ||
+                              s.back() == ' '))
+            s.pop_back();
+        if (isTitleId(s.c_str()))
+            g_saltyTids.push_back(s);
+    }
+    fclose(f);
 }
 
 static std::string lumaPath(const GameProfile &gp)
@@ -1149,6 +1175,14 @@ static std::vector<ModEntry> scanMods(const GameProfile &gp)
         if (a.active != b.active) return a.active;   // active first
         return a.display < b.display;                 // then alphabetical
     });
+
+    // 4. SaltySD titles get a pseudo-entry that opens the loader picker.
+    if (isSalty(gp)) {
+        ModEntry e;
+        e.display = "SaltySD loader...";
+        e.loader  = true;
+        mods.push_back(e);                            // always last
+    }
     return mods;
 }
 
@@ -1236,10 +1270,13 @@ static std::vector<ModEntry> rescanMods(const GameProfile &gp)
 }
 
 // Recompute one game's mod count / active flag (shown in the game list).
+// Pseudo-entries (the loader picker row) don't count as mods.
 static void refreshStats(GameProfile &gp)
 {
     std::vector<ModEntry> m = rescanMods(gp);
-    gp.modCount  = (int)m.size();
+    gp.modCount = 0;
+    for (const ModEntry &e : m)
+        if (!e.loader) ++gp.modCount;
     gp.hasActive = !m.empty() && m.front().active;  // active sorts first
 }
 
@@ -1835,6 +1872,57 @@ static void startUpdateCheck(bool silent = false)
 }
 
 // ---------------------------------------------------------------------------
+// SaltySD loader picker. The code.ips must match the game's exact revision
+// (a mismatch data-aborts at boot), and different mod packs ship different
+// builds - so let the user choose among every copy on the card.
+// ---------------------------------------------------------------------------
+static std::vector<ModEntry> scanLoaders(const GameProfile &gp)
+{
+    std::vector<ModEntry> out;
+    auto add = [&](const std::string &path, const std::string &name) {
+        if (!fileExists(path)) return;
+        ModEntry e;
+        e.path    = path;
+        e.display = name;
+        out.push_back(e);
+    };
+    add(repoPath(gp) + "/code.ips", "Pristine copy (repo root)");
+    add(activePath(gp) + "/code.ips",
+        "From active: " + modDisplayName(activePath(gp), "mod"));
+    if (DIR *dp = opendir(repoPath(gp).c_str())) {
+        struct dirent *ent;
+        while ((ent = readdir(dp)) != NULL) {
+            if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, ".."))
+                continue;
+            const std::string folder = repoPath(gp) + "/" + ent->d_name;
+            if (!isDir(folder)) continue;
+            add(folder + "/code.ips",
+                "From mod: " + modDisplayName(folder, ent->d_name));
+        }
+        closedir(dp);
+    }
+    return out;
+}
+
+// Install the chosen loader where Luma applies it, and refresh the pristine
+// repo-root copy so self-healing propagates this choice from now on.
+static bool installLoader(const GameProfile &gp, const ModEntry &cand,
+                          Status *st)
+{
+    mkdirs(lumaPath(gp));
+    const bool ok = copyFile(cand.path, lumaPath(gp) + "/code.ips");
+    copyFile(cand.path, repoPath(gp) + "/code.ips");
+    invalidateLumaList();
+    if (!ok) {
+        *st = { "Could not install the loader.", SK_ERR };
+        return false;
+    }
+    g_saltyLoaderOk = true;
+    *st = { "Loader installed: " + cand.display, SK_OK };
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Settings (theme persistence)
 // ---------------------------------------------------------------------------
 static void loadSettings()
@@ -2317,10 +2405,12 @@ static void drawTopMods(const GameProfile &gp, const std::vector<ModEntry> &mods
     else
         drawPill(96, 115, "none - vanilla", 0.42f, T.panel2, T.text, false);
 
+    int nMods = 0;
+    for (const ModEntry &m : mods)
+        if (!m.loader) ++nMods;
     drawText(36, 150, 0.45f, T.muted, "Library");
     drawText(104, 150, 0.45f, T.info,
-             std::to_string((int)mods.size()) +
-             (mods.size() == 1 ? " mod" : " mods"));
+             std::to_string(nMods) + (nMods == 1 ? " mod" : " mods"));
 
     if (isSalty(gp) && !g_saltyLoaderOk) {
         roundRect(20, 188, 360, 26, 7, CLR_RED);
@@ -2333,6 +2423,22 @@ static void drawTopMods(const GameProfile &gp, const std::vector<ModEntry> &mods
                        " legacy folder(s) found - press " G_Y " to tidy");
     }
 
+    drawTopFooter();
+}
+
+// Top screen in the SaltySD loader picker.
+static void drawTopLoader()
+{
+    drawTopHeader("SaltySD loader");
+    drawCard(20, 52, 360, 132);
+    drawText(36, 64, 0.55f, CLR_WHITE, "Pick the code.ips patch");
+    drawText(36, 92, 0.42f, T.muted,
+             "SaltySD only works when the loader matches your");
+    drawText(36, 110, 0.42f, T.muted,
+             "game's exact revision. If the game crashes at boot,");
+    drawText(36, 128, 0.42f, T.muted,
+             "come back here and try another copy.");
+    drawText(36, 156, 0.42f, T.muted, G_A " install    " G_B " back");
     drawTopFooter();
 }
 
@@ -2557,14 +2663,37 @@ static void drawBottomMods(const GameProfile &gp, const std::vector<ModEntry> &m
 
         for (int i = start; i < end; ++i) {
             const ModEntry &m = mods[i];
-            const char *badge = m.active ? "ACTIVE" : (m.loose ? "LOOSE" : "");
-            drawListRow(i - start, m.display, i == cursor,
-                        badge, m.active ? CLR_GREEN : CLR_ORANGE);
+            const char *badge = m.active ? "ACTIVE"
+                              : m.loose  ? "LOOSE"
+                              : m.loader ? "SETUP" : "";
+            drawListRow(i - start, m.display, i == cursor, badge,
+                        m.active ? CLR_GREEN : m.loader ? T.info : CLR_ORANGE);
         }
 
         drawScrollbar(total, start);
     }
 
+    drawStatus(st);
+}
+
+// Bottom screen: SaltySD loader picker.
+static void drawBottomLoader(const std::vector<ModEntry> &cands, int cursor,
+                             const Status &st)
+{
+    drawBottomChrome("Choose loader", cursor, (int)cands.size(),
+                     G_A " Install  " G_B " Back", true);
+    if (cands.empty()) {
+        drawTextCenter(160, 100, 0.5f, T.muted, "No code.ips found");
+        drawTextCenter(160, 125, 0.4f, T.muted,
+                       "Put one in a mod folder or the repo root");
+    } else {
+        int start, end;
+        viewport((int)cands.size(), cursor, start, end);
+        trackSelection(cursor - start);
+        for (int i = start; i < end; ++i)
+            drawListRow(i - start, cands[i].display, i == cursor, "", 0);
+        drawScrollbar((int)cands.size(), start);
+    }
     drawStatus(st);
 }
 
@@ -2603,6 +2732,8 @@ static std::vector<GameProfile> g_bootProfiles;
 static void bootWorker(void *)
 {
     sndInit();          // reads dspfirm.cdc from SD - off the boot path
+    mkdirs(MOD_REPO);   // first run: make the repo visible to FTP users
+    loadSaltyList();
     loadNameCache();
 
     std::vector<GameProfile> p = discoverProfiles();
@@ -2669,7 +2800,9 @@ int main(int argc, char **argv)
     bool bootLoaded = false;
     threadCreate(bootWorker, NULL, 64 * 1024, 0x31, -2, true);
 
-    enum AppState { ST_GAMES, ST_MODS, ST_THEMES };
+    enum AppState { ST_GAMES, ST_MODS, ST_THEMES, ST_LOADER };
+    std::vector<ModEntry> loaders;   // SaltySD loader picker candidates
+    int loaderCursor = 0;
     AppState state       = ST_GAMES;
     AppState themeReturn = ST_GAMES;
 
@@ -2846,7 +2979,7 @@ int main(int argc, char **argv)
                 sndPlay(SND_CONFIRM);
             }
         }
-        else { // ST_MODS
+        else if (state == ST_MODS) {
             const GameProfile &gp = profiles[selected];
 
             if (navList(modCursor, (int)mods.size(), kNav, dragRows))
@@ -2889,16 +3022,51 @@ int main(int argc, char **argv)
             }
             else if (!mods.empty()) {
                 if (actUse || (kDown & KEY_A)) {
-                    // On success the activated mod sorts to the top; follow it
-                    // with the cursor so the selection tracks what you just did.
-                    if (activateMod(gp, mods[modCursor], &status)) {
-                        modCursor = 0;
+                    if (mods[modCursor].loader) {
+                        // The pseudo-entry opens the loader picker.
+                        loaders      = scanLoaders(gp);
+                        loaderCursor = 0;
+                        state        = ST_LOADER;
                         sndPlay(SND_CONFIRM);
                     } else {
-                        sndPlay(SND_ERROR);
+                        // On success the activated mod sorts to the top;
+                        // follow it so the selection tracks what you did.
+                        if (activateMod(gp, mods[modCursor], &status)) {
+                            modCursor = 0;
+                            sndPlay(SND_CONFIRM);
+                        } else {
+                            sndPlay(SND_ERROR);
+                        }
+                        refreshModList(gp);
                     }
-                    refreshModList(gp);
                 }
+            }
+        }
+
+        else { // ST_LOADER
+            if (navList(loaderCursor, (int)loaders.size(), kNav, dragRows))
+                sndPlay(SND_MOVE);
+
+            bool actUse = false;
+            if (touchRow >= 0 && !loaders.empty()) {
+                int vs, ve;
+                viewport((int)loaders.size(), loaderCursor, vs, ve);
+                const int idx = vs + touchRow;
+                if (idx < ve) {
+                    if (idx == loaderCursor) actUse = true;
+                    else { loaderCursor = idx; sndPlay(SND_MOVE); }
+                }
+            }
+
+            if ((kDown & KEY_B) || touchBack) {
+                state = ST_MODS;
+                sndPlay(SND_BACK);
+            }
+            else if (!loaders.empty() && (actUse || (kDown & KEY_A))) {
+                sndPlay(installLoader(profiles[selected],
+                                      loaders[loaderCursor], &status)
+                            ? SND_CONFIRM : SND_ERROR);
+                state = ST_MODS;
             }
         }
 
@@ -3011,6 +3179,7 @@ int main(int argc, char **argv)
         drawBackground(topParticles, 400);
         if      (state == ST_GAMES)  drawTopGames(profiles, gameCursor);
         else if (state == ST_MODS)   drawTopMods(profiles[selected], mods);
+        else if (state == ST_LOADER) drawTopLoader();
         else                         drawTopThemes();
         if (fadeA) C2D_DrawRectSolid(0, 0, 0.9f, 400, 240,
                                      C2D_Color32(0, 0, 0, fadeA));
@@ -3020,6 +3189,7 @@ int main(int argc, char **argv)
         drawBackground(botParticles, 320);
         if      (state == ST_GAMES)  drawBottomGames(profiles, gameCursor, status);
         else if (state == ST_MODS)   drawBottomMods(profiles[selected], mods, modCursor, status);
+        else if (state == ST_LOADER) drawBottomLoader(loaders, loaderCursor, status);
         else                         drawBottomThemes(themeCursor);
         if (fadeA) C2D_DrawRectSolid(0, 0, 0.9f, 320, 240,
                                      C2D_Color32(0, 0, 0, fadeA));

@@ -4,6 +4,19 @@ All notable changes to the 3DS Mod Manager. Versions before this repo was
 created (v3.0) are reconstructed from session notes — early entries are
 approximate.
 
+## v4.0 — 2026-07-04 — public-ready
+
+- **SaltySD loader picker**: a "SaltySD loader..." entry at the bottom of a
+  SaltySD game's mod list opens a picker of every code.ips on the card
+  (pristine repo copy, active mod's, each stored mod's) and installs the
+  chosen one into luma/titles + the self-heal source. The cure for
+  loader/revision mismatches, now user-serviceable.
+- **Multi-region SaltySD**: USA and EUR Smash recognized out of the box;
+  extra Title IDs (other regions / other SaltySD games) via
+  `sdmc:/3ds/3dsmods/saltysd.txt`, one per line.
+- MIT license; README install guide for new users; the mod repo folder is
+  created on first run; CIA metadata updated ("3DS Mod Manager").
+
 ## v3.9.1 — 2026-07-04
 
 - Plan B installer: when AM_StartCiaInstall refuses (the recurring
