@@ -59,7 +59,7 @@
 
 // Single source of truth for the app version (shown in the header, stamped
 // into the lookup log, and compared against GitHub release tags).
-#define APP_VER "4.1.0"
+#define APP_VER "4.2.0"
 
 // ---------------------------------------------------------------------------
 // Locations
@@ -1679,6 +1679,31 @@ static bool verifySignature(const std::vector<u8> &data,
 
 static bool g_netUp = false;   // soc + curl brought up on first check
 
+// Ask the system to bring Wi-Fi back up. The console silently drops the
+// connection after sleep, and homebrew gets no automatic reconnect - only
+// an explicit AC request (what games do behind their spinner) re-associates.
+static bool ensureWifi(int timeoutSec)
+{
+    u32 status = 0;
+    if (R_SUCCEEDED(ACU_GetWifiStatus(&status)) && status != 0)
+        return true;   // already connected
+
+    acuConfig cfg;
+    if (R_FAILED(ACU_CreateDefaultConfig(&cfg))) return false;
+    ACU_SetNetworkArea(&cfg, 2);
+    ACU_SetAllowApType(&cfg, 0x7);   // any of the console's 3 AP slots
+    ACU_SetRequestEulaVersion(&cfg);
+
+    Handle ev = 0;
+    if (R_FAILED(svcCreateEvent(&ev, RESET_ONESHOT))) return false;
+    if (R_SUCCEEDED(ACU_ConnectAsync(&cfg, ev)))
+        svcWaitSynchronization(ev, (s64)timeoutSec * 1000000000LL);
+    svcCloseHandle(ev);
+
+    status = 0;
+    return R_SUCCEEDED(ACU_GetWifiStatus(&status)) && status != 0;
+}
+
 // ---------------------------------------------------------------------------
 // Plan B installer. AM_StartCiaInstall starts refusing (D8E08027 at the
 // first write) after a title has been self-overwritten; the fine-grained
@@ -1791,6 +1816,14 @@ static void updWorker(void *)
     }
 
     if (FILE *f = fopen("sdmc:/3ds/3dsmods/update.log", "w")) fclose(f);
+
+    // Reconnect Wi-Fi if the console dropped it (short patience for the
+    // silent boot check, longer when the user asked).
+    if (!ensureWifi(g_updSilent ? 5 : 12)) {
+        if (g_updSilent) g_updState = UPD_IDLE;   // quiet no-network boot
+        else             updFail("wifi", -1);
+        return;
+    }
 
     std::vector<u8> body;
     Result rc = httpGet(UPDATE_API, body, false);
@@ -2850,6 +2883,7 @@ int main(int argc, char **argv)
 
     gfxInitDefault();
     ptmuInit();     // battery level for the header indicator
+    acInit();       // Wi-Fi reconnect requests for the updater
     amInit();       // self-updater: CIA install (cheap; net init is lazy)
     C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
     C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
@@ -3289,6 +3323,7 @@ int main(int argc, char **argv)
     C2D_Fini();
     C3D_Fini();
     amExit();
+    acExit();
     if (g_netUp) { curl_global_cleanup(); socExit(); }
     sndExit();
     ptmuExit();

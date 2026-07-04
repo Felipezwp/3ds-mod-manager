@@ -4,6 +4,10 @@ A homebrew mod manager for the Nintendo 3DS that hot-swaps game mods on the
 console itself — no PC required after setup. Built with libctru + citro2d.
 Works on every model (old/New 3DS/2DS) with Luma3DS. MIT licensed.
 
+> **LLM-generated content: Yes.** This app was written with AI assistance
+> (Anthropic's Claude); a human (Felipezwp) directs development and tests
+> every release on real hardware.
+
 ## Screenshots
 
 | Game view (Crimson theme) | Game list |

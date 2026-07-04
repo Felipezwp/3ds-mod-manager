@@ -4,6 +4,14 @@ All notable changes to the 3DS Mod Manager. Versions before this repo was
 created (v3.0) are reconstructed from session notes — early entries are
 approximate.
 
+## v4.2 — 2026-07-04
+
+- The updater now asks the system to reconnect Wi-Fi before checking
+  (consoles silently drop the connection after sleep; homebrew never gets
+  it back without an explicit AC request). Manual checks wait up to 12 s,
+  the silent boot check gives up quietly after 5 s.
+- README: explicit LLM-generated-content disclosure.
+
 ## v4.1 — 2026-07-04
 
 - Patch notes in the updater: when an update is offered (and while it
