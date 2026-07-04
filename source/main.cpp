@@ -59,7 +59,7 @@
 
 // Single source of truth for the app version (shown in the header, stamped
 // into the lookup log, and compared against GitHub release tags).
-#define APP_VER "3.9.0"
+#define APP_VER "3.9.1"
 
 // ---------------------------------------------------------------------------
 // Locations
@@ -1610,6 +1610,103 @@ static bool verifySignature(const std::vector<u8> &data,
 
 static bool g_netUp = false;   // soc + curl brought up on first check
 
+// ---------------------------------------------------------------------------
+// Plan B installer. AM_StartCiaInstall starts refusing (D8E08027 at the
+// first write) after a title has been self-overwritten; the fine-grained
+// import API with InstallTitleBeginForOverwrite is what system software
+// uses to replace an installed title in place, so fall back to it: parse
+// the CIA container and stream ticket -> TMD -> contents -> commit.
+// ---------------------------------------------------------------------------
+static u32 be32(const u8 *p) { return ((u32)p[0]<<24)|((u32)p[1]<<16)|((u32)p[2]<<8)|p[3]; }
+static u16 be16(const u8 *p) { return (u16)(((u16)p[0]<<8)|p[1]); }
+static u64 be64(const u8 *p) { return ((u64)be32(p)<<32)|be32(p+4); }
+
+static Result writeAll(Handle h, const u8 *data, u64 size,
+                       const char **stage, const char *what)
+{
+    u64 off = 0;
+    while (off < size) {
+        const u32 n = (u32)std::min<u64>(0x10000, size - off);
+        u32 written = 0;
+        Result rc = FSFILE_Write(h, &written, off, data + off, n,
+                                 FS_WRITE_FLUSH);
+        if (R_FAILED(rc)) { *stage = what; return rc; }
+        off += written;
+    }
+    return 0;
+}
+
+static Result installCiaOverwrite(const std::vector<u8> &cia,
+                                  const char **stage)
+{
+    const u8 *d = cia.data();
+    // CIA sections are 0x40-aligned: header, certs, ticket, TMD, content.
+    u32 hdrSize, certSize, tikSize, tmdSize;
+    memcpy(&hdrSize,  d + 0x00, 4);
+    memcpy(&certSize, d + 0x08, 4);
+    memcpy(&tikSize,  d + 0x0C, 4);
+    memcpy(&tmdSize,  d + 0x10, 4);
+    const u64 tikOff = ((u64)((hdrSize + 0x3F) & ~0x3Fu) + certSize + 0x3F) & ~0x3Full;
+    const u64 tmdOff = (tikOff + tikSize + 0x3F) & ~0x3Full;
+    const u64 cntOff = (tmdOff + tmdSize + 0x3F) & ~0x3Full;
+    if (cntOff >= cia.size()) { *stage = "ov-parse"; return -1; }
+
+    const u8 *tmd     = d + tmdOff;
+    const u32 sigType = be32(tmd);
+    const u32 hdrOff  = sigType == 0x00010003 ? 0x240 :
+                        sigType == 0x00010004 ? 0x140 : 0x80;
+    const u16 nContent = be16(tmd + hdrOff + 0x9E);
+    if (nContent == 0 || nContent > 8) { *stage = "ov-tmd-count"; return -2; }
+
+    const u64 tid = 0x0004000005BD3700ULL;
+    Result rc;
+    Handle h;
+
+    *stage = "ov-ticket";
+    rc = AMNET_InstallTicketBegin(&h);
+    if (R_FAILED(rc)) return rc;
+    rc = writeAll(h, d + tikOff, tikSize, stage, "ov-ticket-w");
+    if (R_SUCCEEDED(rc)) rc = AMNET_InstallTicketFinish(h);
+    else AMNET_InstallTicketAbort(h);
+    if (R_FAILED(rc)) return rc;
+
+    *stage = "ov-begin";
+    rc = AMNET_InstallTitleBeginForOverwrite(tid, MEDIATYPE_SD);
+    if (R_FAILED(rc)) return rc;
+
+    *stage = "ov-tmd";
+    rc = AMNET_InstallTmdBegin(&h);
+    if (R_SUCCEEDED(rc)) {
+        rc = writeAll(h, tmd, tmdSize, stage, "ov-tmd-w");
+        if (R_SUCCEEDED(rc)) rc = AMNET_InstallTmdFinish(h, true);
+    }
+    if (R_FAILED(rc)) { AMNET_InstallTitleAbort(); return rc; }
+
+    u64 dataOff = cntOff;   // contents follow in record order
+    for (u16 i = 0; i < nContent; ++i) {
+        const u8 *rec   = tmd + hdrOff + 0x9C4 + (u32)i * 0x30;
+        const u16 index = be16(rec + 4);
+        const u64 size  = be64(rec + 8);
+        *stage = "ov-content";
+        rc = AMNET_InstallContentBegin(&h, index);
+        if (R_FAILED(rc)) break;
+        rc = writeAll(h, d + dataOff, size, stage, "ov-content-w");
+        if (R_SUCCEEDED(rc)) rc = AMNET_InstallContentFinish(h);
+        else AMNET_InstallContentCancel(h);
+        if (R_FAILED(rc)) break;
+        dataOff += size;
+    }
+    if (R_FAILED(rc)) { AMNET_InstallTitleAbort(); return rc; }
+
+    *stage = "ov-finish";
+    rc = AMNET_InstallTitleFinish();
+    if (R_FAILED(rc)) return rc;
+
+    *stage = "ov-commit";
+    u64 tids[1] = { tid };
+    return AMNET_CommitImportTitles(MEDIATYPE_SD, 1, false, tids);
+}
+
 static void updWorker(void *)
 {
     // Networking is initialized lazily so boot never pays for the 1 MB
@@ -1701,6 +1798,11 @@ static void updWorker(void *)
             updLog("unwedge: resume=%08lX abort=%08lX",
                    (unsigned long)r1, (unsigned long)r2);
             rc = installCia(cia, &stage);
+        }
+        if (R_FAILED(rc)) {
+            // Plan B: the system-updater import path (overwrite-in-place).
+            updLog("plan B: overwrite import");
+            rc = installCiaOverwrite(cia, &stage);
         }
         if (R_FAILED(rc)) {
             updFail(stage, rc);

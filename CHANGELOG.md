@@ -4,6 +4,14 @@ All notable changes to the 3DS Mod Manager. Versions before this repo was
 created (v3.0) are reconstructed from session notes — early entries are
 approximate.
 
+## v3.9.1 — 2026-07-04
+
+- Plan B installer: when AM_StartCiaInstall refuses (the recurring
+  D8E08027-at-byte-0 on previously self-overwritten titles), fall back to
+  the fine-grained AM import API with InstallTitleBeginForOverwrite — the
+  flow system software uses to replace an installed title in place. Parses
+  the CIA container and streams ticket -> TMD -> contents -> commit.
+
 ## v3.9 — 2026-07-04
 
 - **Signed updates.** TLS verification is off on the 3DS (no usable CA
