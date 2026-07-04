@@ -1,5 +1,5 @@
 /*
- * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.5
+ * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v3.7
  * ---------------------------------------------------------------------------
  * Swaps the active mod for a game by MOVING folders between a central
  * per-title mod repository and the game's "active" location:
@@ -57,7 +57,7 @@
 
 // Single source of truth for the app version (shown in the header, stamped
 // into the lookup log, and compared against GitHub release tags).
-#define APP_VER "3.6.1"
+#define APP_VER "3.7.0"
 
 // ---------------------------------------------------------------------------
 // Locations
@@ -594,7 +594,8 @@ static void smdhLogf(const char *fmt, ...)
 // The boot scan runs on a worker thread, but GPU textures must be created
 // on the main thread: workers enqueue raw pixels, the main loop drains the
 // queue between frames. g_gameIcons itself is main-thread-only.
-static std::vector<std::pair<std::string, C2D_Image>> g_gameIcons;
+struct IconEntry { std::string tid; C2D_Image img; u32 accent; };
+static std::vector<IconEntry> g_gameIcons;
 
 struct PendingIcon { std::string tid; std::vector<u16> px; };
 static LightLock                 g_iconLock;
@@ -604,8 +605,16 @@ static std::vector<std::string>  g_iconTids;   // every tid ever enqueued
 static const C2D_Image *gameIcon(const std::string &titleId)
 {
     for (const auto &e : g_gameIcons)
-        if (e.first == titleId) return &e.second;
+        if (e.tid == titleId) return &e.img;
     return NULL;
+}
+
+// The game's dominant color, extracted from its icon (0 if unknown).
+static u32 gameAccent(const std::string &titleId)
+{
+    for (const auto &e : g_gameIcons)
+        if (e.tid == titleId) return e.accent;
+    return 0;
 }
 
 // Thread-safe: remembers the pixels; the texture is built by drainIcons().
@@ -641,8 +650,31 @@ static void drainIcons()
         C3D_TexSetFilter(tex, GPU_LINEAR, GPU_LINEAR);
         static const Tex3DS_SubTexture sub = { 48, 48, 0.0f, 1.0f,
                                                0.75f, 0.25f };
-        const C2D_Image img = { tex, &sub };
-        g_gameIcons.push_back(std::make_pair(pi.tid, img));
+
+        // Saturation-weighted average color: colorful pixels dominate, so
+        // the accent reads as the game's brand color instead of muddy gray.
+        u64 sr = 0, sg = 0, sb = 0, sw = 0;
+        for (int i = 0; i < 48 * 48; ++i) {
+            const u16 v = pi.px[i];
+            const int r = (v >> 11) << 3;
+            const int g = ((v >> 5) & 0x3F) << 2;
+            const int b = (v & 0x1F) << 3;
+            const int mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+            const int mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+            const u64 w  = (u64)(mx - mn) + 4;   // +4: grays still count a bit
+            sr += (u64)r * w; sg += (u64)g * w; sb += (u64)b * w; sw += w;
+        }
+        int r = (int)(sr / sw), g = (int)(sg / sw), b = (int)(sb / sw);
+        const int mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+        if (mx > 0) {   // normalize toward a readable glow brightness
+            r = r * 230 / mx; g = g * 230 / mx; b = b * 230 / mx;
+        }
+
+        IconEntry e;
+        e.tid    = pi.tid;
+        e.img    = { tex, &sub };
+        e.accent = C2D_Color32((u8)r, (u8)g, (u8)b, 0xFF);
+        g_gameIcons.push_back(e);
     }
 }
 
@@ -1588,6 +1620,18 @@ static u32 lerpColor(u32 a, u32 b, float t)
                        (u8)(ab + (bb - ab) * t), (u8)(aa + (ba - aa) * t));
 }
 
+// Eased accent of the hovered game (its icon's dominant color): the header
+// strip, card glow and selection highlight all lean toward it, so every
+// game gets its own presence as you scroll. 0 = not established yet.
+static u32 g_gameTint = 0;
+
+static u32 tinted(u32 base, float amount)
+{
+    return g_gameTint ? lerpColor(base, withAlpha(g_gameTint, base >> 24),
+                                  amount)
+                      : base;
+}
+
 // Axis-aligned gradients.
 static void vGrad(float x, float y, float w, float h, u32 top, u32 bottom)
 {
@@ -1740,19 +1784,21 @@ static void drawBackground(std::vector<Particle> &ps, float w)
     }
 }
 
-// Animated two-tone accent strip (used under headers).
+// Animated two-tone accent strip (used under headers), leaning toward the
+// hovered game's color.
 static void drawAccentStrip(float x, float y, float w, float h)
 {
     const u32 l = lerpColor(T.accent, T.secondary, 0.5f + 0.5f * sinf(g_t * 0.7f));
     const u32 r = lerpColor(T.info,   T.accent,    0.5f + 0.5f * sinf(g_t * 0.7f + 2.1f));
-    hGrad(x, y, w, h, l, r);
+    hGrad(x, y, w, h, tinted(l, 0.45f), tinted(r, 0.45f));
 }
 
 // Card panel: drop shadow + soft animated border glow.
 static void drawCard(float x, float y, float w, float h)
 {
     const float pulse = 0.5f + 0.5f * sinf(g_t * 1.6f);
-    const u32 glow = withAlpha(lerpColor(T.accent, T.secondary, pulse), 110);
+    const u32 glow = withAlpha(
+        tinted(lerpColor(T.accent, T.secondary, pulse), 0.55f), 110);
     roundRect(x + 2.5f, y + 3.5f, w, h, 10.0f, C2D_Color32(0, 0, 0, 90));
     roundRect(x - 1.5f, y - 1.5f, w + 3.0f, h + 3.0f, 11.5f, glow);
     roundRect(x, y, w, h, 10.0f, T.panel);
@@ -1845,6 +1891,7 @@ static float g_screenAnim = 1.0f;   // 0 -> 1 after each screen change
 static float g_selAnim    = 0.0f;   // eased highlight slot in bottom lists
 static bool  g_selSnap    = true;   // teleport the highlight next frame
 static float g_statusAge  = 999.0f; // seconds since the toast text changed
+
 
 static float easeOutCubic(float t)
 {
@@ -2113,7 +2160,8 @@ static void drawListRow(int slot, const std::string &name, bool selected,
         const float pulse = 0.5f + 0.5f * sinf(g_t * 2.4f);
         roundRect(x + 2, hy + 4, rowW, ROW_H - 5, 8, C2D_Color32(0, 0, 0, 80));
         roundRect(x - 1, hy + 1, rowW + 2, ROW_H - 3, 8,
-                  withAlpha(lerpColor(T.accent, T.secondary, pulse), 95));
+                  withAlpha(tinted(lerpColor(T.accent, T.secondary, pulse),
+                                   0.40f), 95));
         roundRect(x + 1, hy + 3, rowW - 2, ROW_H - 7, 7,
                   lerpColor(T.selL, T.selR, 0.5f + 0.5f * sinf(g_t * 0.9f)));
         C2D_DrawRectSolid(x + 4, hy + 7, 0.5f, 3, ROW_H - 15,
@@ -2461,6 +2509,14 @@ int main(int argc, char **argv)
             if (n > 0 && (kNav & KEY_DOWN)) gameCursor = (gameCursor + 1) % n;
             if (n > 0 && (kNav & KEY_UP))   gameCursor = (gameCursor - 1 + n) % n;
 
+            // Left/Right jump a whole page - fast travel for big libraries.
+            if (n > 0 && (kNav & (KEY_LEFT | KEY_RIGHT))) {
+                gameCursor += (kNav & KEY_RIGHT) ? LIST_ROWS : -LIST_ROWS;
+                if (gameCursor < 0)  gameCursor = 0;
+                if (gameCursor >= n) gameCursor = n - 1;
+                sndPlay(SND_MOVE);
+            }
+
             if (dragRows && n > 0) {
                 gameCursor += dragRows;
                 if (gameCursor < 0)  gameCursor = 0;
@@ -2570,6 +2626,13 @@ int main(int argc, char **argv)
                     modCursor = (modCursor + 1) % (int)mods.size();
                 if (kNav & KEY_UP)
                     modCursor = (modCursor - 1 + (int)mods.size()) % (int)mods.size();
+                if (kNav & (KEY_LEFT | KEY_RIGHT)) {   // page jump
+                    modCursor += (kNav & KEY_RIGHT) ? LIST_ROWS : -LIST_ROWS;
+                    if (modCursor < 0) modCursor = 0;
+                    if (modCursor >= (int)mods.size())
+                        modCursor = (int)mods.size() - 1;
+                    sndPlay(SND_MOVE);
+                }
                 if (actUse || (kDown & KEY_A)) {
                     // On success the activated mod sorts to the top; follow it
                     // with the cursor so the selection tracks what you just did.
@@ -2641,6 +2704,21 @@ int main(int argc, char **argv)
         static float toastBorn = -999.0f;
         if (status.msg != lastToast) { lastToast = status.msg; toastBorn = g_t; }
         g_statusAge = g_t - toastBorn;
+
+        // Ease the ambient tint toward the hovered game's icon color
+        // (neutral theme accent in the theme picker / while scanning).
+        {
+            u32 target = T.accent;
+            if (state == ST_GAMES && !profiles.empty()) {
+                const u32 a = gameAccent(profiles[gameCursor].titleId);
+                if (a) target = a;
+            } else if (state == ST_MODS) {
+                const u32 a = gameAccent(profiles[selected].titleId);
+                if (a) target = a;
+            }
+            g_gameTint = g_gameTint ? lerpColor(g_gameTint, target, 0.10f)
+                                    : target;
+        }
 
         C2D_TextBufClear(g_textBuf);
         C3D_FrameBegin(C3D_FRAME_SYNCDRAW);

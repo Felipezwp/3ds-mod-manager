@@ -4,6 +4,15 @@ All notable changes to the 3DS Mod Manager. Versions before this repo was
 created (v3.0) are reconstructed from session notes — early entries are
 approximate.
 
+## v3.7 — 2026-07-03
+
+- **Dynamic game presence**: the header strip, top-card glow and selection
+  highlight now ease toward the hovered game's dominant color, extracted
+  from its icon with a saturation-weighted average (computed once per icon
+  at boot — zero extra I/O, zero per-frame cost beyond one lerp).
+- **Page jump**: D-pad Left/Right skips a full page in the game and mod
+  lists (clamped) — fast travel for big libraries. L/R stay on themes.
+
 ## v3.6 — 2026-07-03
 
 - **Auto update check on boot**: a silent background check runs after the

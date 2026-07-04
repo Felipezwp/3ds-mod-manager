@@ -35,7 +35,7 @@ APP_UNIQUE_ID		:=	0x5BD37
 # TMD title version: major<<10 | minor<<4 | micro. Bump on every release --
 # the HOME menu caches title icons and only refreshes them when an install
 # registers as an update (version increased).
-APP_VERSION			:=	3169	# 3.6.1
+APP_VERSION			:=	3184	# 3.7.0
 
 # Banner / icon assets used by makerom when building the CIA.
 ICON			:=	$(CURDIR)/icon.png
