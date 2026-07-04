@@ -59,7 +59,7 @@
 
 // Single source of truth for the app version (shown in the header, stamped
 // into the lookup log, and compared against GitHub release tags).
-#define APP_VER "4.0.0"
+#define APP_VER "4.1.0"
 
 // ---------------------------------------------------------------------------
 // Locations
@@ -1553,6 +1553,38 @@ static bool verNewer(const char *tag)
     return false;
 }
 
+// Release notes ("what's new"), shown on the top screen while an update is
+// offered or being applied. Filled from the release JSON we already fetch -
+// zero extra requests, zero UI when no update is in play.
+static char         g_updNotes[5][96];
+static volatile int g_updNotesN = 0;
+
+// Escape-aware JSON string extraction (the notes body contains \n, \" etc.,
+// which the simple jsonStr below would truncate on).
+static std::string jsonStrEsc(const std::string &js, const std::string &key)
+{
+    const std::string pat = "\"" + key + "\":\"";
+    size_t p = js.find(pat);
+    if (p == std::string::npos) return "";
+    p += pat.size();
+    std::string out;
+    while (p < js.size()) {
+        const char c = js[p++];
+        if (c == '"') break;
+        if (c == '\\' && p < js.size()) {
+            const char e = js[p++];
+            if      (e == 'n') out += '\n';
+            else if (e == 'r') { }
+            else if (e == 't') out += ' ';
+            else if (e == 'u') { p += 4; }
+            else out += e;
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
 // Pull `"key":"value"` out of the (flat enough) GitHub JSON.
 static std::string jsonStr(const std::string &js, const std::string &key,
                            size_t from = 0)
@@ -1769,6 +1801,28 @@ static void updWorker(void *)
     snprintf(g_updTag, sizeof(g_updTag), "%s", tag.c_str());
     if (tag.empty()) { updFail("tag", 0); return; }
     if (!verNewer(tag.c_str())) { g_updState = UPD_UPTODATE; return; }
+
+    // Stash the first few lines of the release notes for the top screen.
+    {
+        const std::string body = jsonStrEsc(js, "body");
+        int n = 0;
+        size_t pos = 0;
+        while (n < 5 && pos <= body.size()) {
+            size_t nl = body.find('\n', pos);
+            if (nl == std::string::npos) nl = body.size();
+            std::string line = body.substr(pos, nl - pos);
+            pos = nl + 1;
+            while (!line.empty() && (line[0] == '#' || line[0] == '-' ||
+                                     line[0] == '*' || line[0] == ' '))
+                line.erase(0, 1);
+            rtrim(line);
+            if (line.empty()) continue;
+            snprintf(g_updNotes[n], sizeof(g_updNotes[n]), "%s",
+                     utf8Sanitize(line).c_str());
+            ++n;
+        }
+        g_updNotesN = n;
+    }
 
     // The silent boot check stops here: announce, never install unasked.
     if (g_updSilent) { g_updState = UPD_AVAILABLE; return; }
@@ -2426,6 +2480,24 @@ static void drawTopMods(const GameProfile &gp, const std::vector<ModEntry> &mods
     drawTopFooter();
 }
 
+// "What's new" panel over the top screen - only while an update is being
+// offered (a few seconds after the boot toast) or actively applied.
+static float g_updNotesUntil = 0.0f;
+static void drawUpdateNotes()
+{
+    const bool busy = g_updState == UPD_DOWNLOADING ||
+                      g_updState == UPD_INSTALLING  ||
+                      g_updState == UPD_DONE;
+    if (g_updNotesN == 0 || (!busy && g_t >= g_updNotesUntil)) return;
+
+    drawCard(28, 46, 344, 152);
+    drawText(44, 58, 0.5f, CLR_WHITE,
+             std::string("What's new in ") + g_updTag);
+    for (int i = 0; i < g_updNotesN; ++i)
+        drawText(44, 84 + i * 21, 0.4f, T.text,
+                 fitText(g_updNotes[i], 0.4f, 312));
+}
+
 // Top screen in the SaltySD loader picker.
 static void drawTopLoader()
 {
@@ -3080,6 +3152,7 @@ int main(int argc, char **argv)
             case UPD_AVAILABLE:
                 status = { "Update " + std::string(g_updTag) +
                            " available - press " G_Y "!", SK_OK };
+                g_updNotesUntil = g_t + 12.0f;   // show "what's new" a while
                 g_updState = UPD_IDLE;   // one-shot; Y starts the install
                 sndPlay(SND_CONFIRM);
                 break;
@@ -3181,6 +3254,7 @@ int main(int argc, char **argv)
         else if (state == ST_MODS)   drawTopMods(profiles[selected], mods);
         else if (state == ST_LOADER) drawTopLoader();
         else                         drawTopThemes();
+        drawUpdateNotes();
         if (fadeA) C2D_DrawRectSolid(0, 0, 0.9f, 400, 240,
                                      C2D_Color32(0, 0, 0, fadeA));
 

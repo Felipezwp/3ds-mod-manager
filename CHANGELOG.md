@@ -4,6 +4,13 @@ All notable changes to the 3DS Mod Manager. Versions before this repo was
 created (v3.0) are reconstructed from session notes — early entries are
 approximate.
 
+## v4.1 — 2026-07-04
+
+- Patch notes in the updater: when an update is offered (and while it
+  installs), the top screen shows the release's "what's new" — pulled from
+  the release JSON the updater already fetches, so zero extra requests and
+  zero UI outside update moments.
+
 ## v4.0 — 2026-07-04 — public-ready
 
 - **SaltySD loader picker**: a "SaltySD loader..." entry at the bottom of a
