@@ -67,18 +67,18 @@ make        # 3dsx
 make cia    # installable CIA
 ```
 
-On this machine the devkitPro msys2 shell is required:
+On Windows, run make from devkitPro's msys2 shell:
 
 ```
-/c/devkitPro/msys2/usr/bin/bash -lc 'cd "<repo>" && make && make cia'
+/c/devkitPro/msys2/usr/bin/bash -lc 'cd "<path to repo>" && make && make cia'
 ```
 
 ## SaltySD notes (hard-won)
 
 - The SaltySD loader `code.ips` must match the exact game code revision.
-  The official GitHub v1.2 USA build did **not** match this cart+update
-  combo (hooks shifted +0x24) and crashed at boot; the loader bundled with
-  older mod packs did match. If Smash data-aborts at boot with a register
+  The official GitHub v1.2 USA build does not match every cart/update
+  combo (hooks can be shifted, e.g. +0x24) and a mismatch crashes at boot;
+  loaders bundled with older mod packs may be the matching ones. If Smash data-aborts at boot with a register
   holding an ARM opcode (e.g. `0xE8BD8070`), suspect loader/game mismatch.
 - The manager keeps a pristine loader at `3ds/3dsmods/<SmashTID>/code.ips`
   and restores `luma/titles/<SmashTID>/code.ips` from it whenever missing.

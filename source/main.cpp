@@ -57,7 +57,7 @@
 
 // Single source of truth for the app version (shown in the header, stamped
 // into the lookup log, and compared against GitHub release tags).
-#define APP_VER "3.8.0"
+#define APP_VER "3.8.1"
 
 // ---------------------------------------------------------------------------
 // Locations
@@ -1475,12 +1475,25 @@ static std::string jsonStr(const std::string &js, const std::string &key,
     return e == std::string::npos ? "" : js.substr(s, e - s);
 }
 
+// Log whether our own title sits in AM's pending/import database - the
+// prime suspect for self-updates dying at am-write@0 (it survives reboots).
+static void logPendingState()
+{
+    u32 n = 0;
+    if (R_FAILED(AM_GetNumPendingTitles(&n, MEDIATYPE_SD))) return;
+    updLog("pending titles on SD: %lu", (unsigned long)n);
+    if (n == 0 || n > 32) return;
+    u64 ids[32];
+    u32 got = 0;
+    if (R_FAILED(AM_GetPendingTitleList(&got, ids, n, MEDIATYPE_SD))) return;
+    for (u32 i = 0; i < got; ++i)
+        if (ids[i] == 0x0004000005BD3700ULL)
+            updLog("OUR title is pending/importing");
+}
+
 static Result installCia(const std::vector<u8> &cia, const char **stage)
 {
-    // Deliberately NO pending-title cleanup: Universal-Updater's proven
-    // self-update flow installs straight over the running title and then
-    // immediately APT-jumps into it, which is what finalizes the import.
-    // (Deleting pending state here is what wedged self-installed copies.)
+    logPendingState();
     *stage = "am-start";
     Handle h;
     Result rc = AM_StartCiaInstall(MEDIATYPE_SD, &h);
@@ -1578,6 +1591,18 @@ static void updWorker(void *)
         }
     } else {
         rc = installCia(cia, &stage);
+        if (R_FAILED(rc)) {
+            // A self-installed running title can carry a stale import
+            // context (persists across reboots!) that makes the next
+            // install die on its first write. Resume + abort that context,
+            // then retry once.
+            const Result r1 =
+                AMNET_InstallTitleResume(MEDIATYPE_SD, 0x0004000005BD3700ULL);
+            const Result r2 = AMNET_InstallTitleAbort();
+            updLog("unwedge: resume=%08lX abort=%08lX",
+                   (unsigned long)r1, (unsigned long)r2);
+            rc = installCia(cia, &stage);
+        }
         if (R_FAILED(rc)) {
             updFail(stage, rc);
             // Graceful fallback: park the CIA where FBI can install it.

@@ -4,6 +4,14 @@ All notable changes to the 3DS Mod Manager. Versions before this repo was
 created (v3.0) are reconstructed from session notes — early entries are
 approximate.
 
+## v3.8.1 — 2026-07-03
+
+- Attempt to unwedge self-updates from self-installed copies: when the
+  install fails, resume + abort our title's stale AM import context (the
+  suspected culprit — it persists across reboots) and retry once. Pending
+  title state is now logged before every install.
+- Changelog/README wording de-personalized.
+
 ## v3.8 — 2026-07-03
 
 - **Five new themes**: Sakura (blossom pink), Vaporwave (magenta/cyan),
@@ -150,7 +158,7 @@ approximate.
   CTRXplorer for good, regardless of which folder scan registered them
 - Mod lists are cached from the boot scan and kept in sync by every
   action, so opening a game's mod menu is now zero SD reads (previously
-  each entry re-read every mod's name markers — slow for Smash's 11 mods).
+  each entry re-read every mod's name markers — noticeably slow for games with many mods).
   External SD changes made mid-session appear after a relaunch.
 
 ## v3.0 — 2026-07-02 — "Release 1" (first tagged release)
@@ -197,7 +205,7 @@ UI motion overhaul:
      folders directly from `saltysd/smash/` — activation now unwraps the
      `romfs/` layer and disable/tidy re-wraps it.
   2. The SaltySD loader that ships on GitHub (v1.2 USA) targets a
-     different code revision than this cart (every hook shifted +0x24) and
+     different code revision than some cart/update combos (every hook shifted +0x24) and
      data-aborted at boot; diagnosed via Luma crash dumps + IPS record
      comparison, fixed by installing the loader from the old working
      ModMoon-era mod pack.
