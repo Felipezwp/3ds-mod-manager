@@ -4,6 +4,12 @@ All notable changes to the 3DS Mod Manager. Versions before this repo was
 created (v3.0) are reconstructed from session notes — early entries are
 approximate.
 
+## v3.8.2 — 2026-07-04
+
+- Fix the download toast replaying its slide-in animation on every
+  percentage tick; while the updater is working the toast now stays pinned
+  (and can no longer time out mid-download).
+
 ## v3.8.1 — 2026-07-03
 
 - Attempt to unwedge self-updates from self-installed copies: when the

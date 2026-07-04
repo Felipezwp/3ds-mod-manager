@@ -57,7 +57,7 @@
 
 // Single source of truth for the app version (shown in the header, stamped
 // into the lookup log, and compared against GitHub release tags).
-#define APP_VER "3.8.1"
+#define APP_VER "3.8.2"
 
 // ---------------------------------------------------------------------------
 // Locations
@@ -2786,6 +2786,13 @@ int main(int argc, char **argv)
         static std::string lastToast;
         static float toastBorn = -999.0f;
         if (status.msg != lastToast) { lastToast = status.msg; toastBorn = g_t; }
+        // While the updater is actively working, its progress text changes
+        // every frame - pin the toast fully shown instead of replaying the
+        // slide-in per percent (and never let it time out mid-download).
+        if (!g_updSilent &&
+            (g_updState == UPD_CHECKING || g_updState == UPD_DOWNLOADING ||
+             g_updState == UPD_INSTALLING))
+            toastBorn = g_t - 0.5f;
         g_statusAge = g_t - toastBorn;
 
         // Ease the ambient tint toward the hovered game's icon color
