@@ -4,6 +4,17 @@ All notable changes to the 3DS Mod Manager. Versions before this repo was
 created (v3.0) are reconstructed from session notes — early entries are
 approximate.
 
+## v4.4 — 2026-10-04
+
+- SaltySD v2: the manager is now the mod library and leaves on/off to the
+  game's Tetra Menu. A installs a library mod into `saltysd/smash/` or
+  removes an installed one back to the library (whether it's on or off);
+  X removes them all. The manager no longer flips mods on/off itself.
+- `is.disabled` (the Tetra Menu's off switch) is kept through every move:
+  a mod switched off in-game stays off after a remove/reinstall, installs
+  say so, and stored mods show "off in-game". The mod menu's top screen
+  shows installed / off-in-game / stored counts.
+
 ## v4.3 — 2026-10-04 — SaltySD v2
 
 - **SaltySD v2 support** (ha1vorsen's 3GX-plugin rewrite). The generation is

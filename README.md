@@ -49,9 +49,13 @@ both behind one UI:
   and detected automatically:
   - **SaltySD v2** ([ha1vorsen's fork](https://github.com/ha1vorsen/SaltySD),
     a Luma 3GX plugin): each mod gets its own folder,
-    `saltysd/smash/<mod>/`, and any number can be on at once. A toggles a
-    mod on/off; mods switched off in the game's Tetra Menu (`is.disabled`)
-    show as OFF. The manager drops v2's scan cache (`saltysd/.saltysd-*`)
+    `saltysd/smash/<mod>/`, and any number can be on at once. The manager
+    is the library: A installs a mod or removes it back to the library.
+    Switching installed mods on/off is the in-game **Tetra Menu**'s job (Y
+    on Smash's main menu); the manager shows that state (ON / OFF) and keeps
+    the Tetra Menu's `is.disabled` marker through every move, so a mod you
+    switched off in-game stays off if you remove and reinstall it. The
+    manager drops v2's scan cache (`saltysd/.saltysd-*`)
     after every change so the game never boots a stale mod list.
   - **SaltySD v1.2** (a `code.ips` patch): one mod at a time, swapped in
     and out of `saltysd/smash/` as before.
@@ -85,8 +89,8 @@ ever deleted.
 | Button | Action |
 | ------ | ------ |
 | D-pad  | Move |
-| A      | Open game / activate mod (SaltySD v2: toggle on/off) |
-| X      | Disable mods (vanilla) / all off |
+| A      | Open game / activate mod (SaltySD v2: install / remove) |
+| X      | Disable mods (vanilla) / SaltySD v2: remove all |
 | Y      | Tidy legacy folders into the repo |
 | B      | Back |
 | SELECT | Theme picker |

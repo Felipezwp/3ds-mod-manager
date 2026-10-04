@@ -1,5 +1,5 @@
 /*
- * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v4.3
+ * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v4.4
  * ---------------------------------------------------------------------------
  * Swaps the active mod for a game by MOVING folders between a central
  * per-title mod repository and the game's "active" location:
@@ -20,7 +20,9 @@
  *   v2:   a 3GX plugin (Luma plugin loader, luma/plugins/<SmashTID>/) reading
  *         MANY mods, one folder each under saltysd/smash/. Any number can be
  *         on at once; a mod holding an is.disabled file (the in-game Tetra
- *         Menu's toggle) is installed but off. v2 caches its mod scan in
+ *         Menu's toggle) is installed but off. The app installs/removes
+ *         mods and leaves on/off to the Tetra Menu, keeping its marker
+ *         through every move. v2 caches its mod scan in
  *         saltysd/.saltysd-*, keyed on folder names only, so the app drops
  *         that cache after every change it makes.
  *
@@ -68,7 +70,7 @@
 
 // Single source of truth for the app version (shown in the header, stamped
 // into the lookup log, and compared against GitHub release tags).
-#define APP_VER "4.3.0"
+#define APP_VER "4.4.0"
 
 // ---------------------------------------------------------------------------
 // Locations
@@ -536,7 +538,8 @@ struct ModEntry {
     bool        active = false; // occupies the active location right now
     bool        loose  = false; // legacy folder (luma/titles, ModMoon, ...)
     bool        loader = false; // pseudo-entry: opens the SaltySD loader picker
-    bool        off    = false; // SaltySD v2: installed, but is.disabled
+    bool        installed = false; // SaltySD v2: a folder in saltysd/smash
+    bool        off    = false; // SaltySD v2: has is.disabled (Tetra Menu off)
     bool        leftover = false; // SaltySD v2: old v1 layout in saltysd/smash
 };
 
@@ -1531,6 +1534,7 @@ static std::vector<ModEntry> scanMods(const GameProfile &gp)
         for (const std::string &n : v2ModFolders()) {
             ModEntry e;
             e.path    = std::string(SALTY_ACTIVE) + "/" + n;
+            e.installed = true;
             e.off     = fileExists(e.path + "/" + SALTY_V2_OFF);
             e.active  = !e.off;
             e.display = modDisplayName(e.path, n);
@@ -1561,6 +1565,7 @@ static std::vector<ModEntry> scanMods(const GameProfile &gp)
             e.path    = full;
             e.active  = false;
             e.loose   = false;
+            e.off     = v2 && fileExists(full + "/" + SALTY_V2_OFF);
             e.display = modDisplayName(full, ent->d_name);
             mods.push_back(e);
         }
@@ -1580,7 +1585,8 @@ static std::vector<ModEntry> scanMods(const GameProfile &gp)
 
     std::sort(mods.begin(), mods.end(), [](const ModEntry &a, const ModEntry &b) {
         if (a.active != b.active) return a.active;   // active first
-        if (a.off != b.off) return a.off;             // then v2 mods set off
+        if (a.installed != b.installed) return a.installed;   // then v2 off
+
         return a.display < b.display;                 // then alphabetical
     });
 
@@ -1696,12 +1702,14 @@ static void refreshStats(GameProfile &gp)
 
 
 // ---------------------------------------------------------------------------
-// SaltySD v2 actions. Any number of mods can be on at once, so A toggles the
-// highlighted mod instead of swapping:
-//   stored/loose mod -> moved into saltysd/smash/<name>/ (romfs/ unwrapped)
-//   on mod           -> moved back to the repo (re-wrapped)
-//   off mod          -> its is.disabled marker is removed (back on)
-//   v1 leftover      -> gathered in place into its own mod folder
+// SaltySD v2 actions. The manager installs and removes; switching installed
+// mods on and off is the in-game Tetra Menu's job, which it does with an
+// is.disabled file in the mod folder. The manager shows that state and
+// never deletes the marker, so a mod switched off in-game stays off through
+// a remove/reinstall round trip. A on the highlighted mod:
+//   library/loose mod -> installed into saltysd/smash/<name>/ (romfs/ unwrapped)
+//   installed mod     -> removed back to the library (re-wrapped), on or off
+//   v1 leftover       -> gathered in place into its own mod folder
 // Every change drops v2's scan cache.
 // ---------------------------------------------------------------------------
 
@@ -1709,7 +1717,6 @@ static void refreshStats(GameProfile &gp)
 static bool v2Store(const GameProfile &gp, const std::string &path)
 {
     mkdirs(repoPath(gp));
-    remove((path + "/" + SALTY_V2_OFF).c_str());   // a stored mod is just stored
     const std::string name   = sanitizeName(modDisplayName(path, baseName(path)));
     const std::string folder = repoModPath(gp, uniqueRepoFolder(gp, name));
     if (rename(path.c_str(), folder.c_str()) != 0) return false;
@@ -1719,23 +1726,13 @@ static bool v2Store(const GameProfile &gp, const std::string &path)
 
 static bool v2Toggle(const GameProfile &gp, const ModEntry &target, Status *st)
 {
-    if (target.off) {
-        if (remove((target.path + "/" + SALTY_V2_OFF).c_str()) != 0) {
-            *st = { "Could not switch the mod back on.", SK_ERR };
-            return false;
-        }
-        dropSaltyIndex();
-        *st = { "On: " + target.display, SK_OK };
-        return true;
-    }
-
-    if (target.active) {
+    if (target.installed) {
         if (!v2Store(gp, target.path)) {
-            *st = { "Could not turn the mod off.", SK_ERR };
+            *st = { "Could not remove the mod.", SK_ERR };
             return false;
         }
         dropSaltyIndex();
-        *st = { "Off (stored): " + target.display, SK_OK };
+        *st = { "Removed to library: " + target.display, SK_OK };
         return true;
     }
 
@@ -1758,11 +1755,10 @@ static bool v2Toggle(const GameProfile &gp, const ModEntry &target, Status *st)
             return false;
         }
     } else if (rename(target.path.c_str(), dst.c_str()) != 0) {
-        *st = { "Could not turn the mod on.", SK_ERR };
+        *st = { "Could not install the mod.", SK_ERR };
         return false;
     }
     saltyUnwrap(dst);
-    remove((dst + "/" + SALTY_V2_OFF).c_str());
     // Folding the name to ASCII must not lose it: record the original.
     if (!hasMarker(dst) && folder != base) {
         if (FILE *f = fopen((dst + "/" + MARKER_FILE).c_str(), "w")) {
@@ -1774,13 +1770,15 @@ static bool v2Toggle(const GameProfile &gp, const ModEntry &target, Status *st)
     invalidateLumaList();   // a loose luma/titles folder may have moved
     dropSaltyIndex();
     g_saltyLoaderOk = ensureSaltyLoader(gp);
-    *st = { "On: " + modDisplayName(dst, folder), SK_OK };
+    const bool off = fileExists(dst + "/" + SALTY_V2_OFF);
+    *st = off ? Status{ "Installed, still off - switch on in the Tetra Menu", SK_OK }
+              : Status{ "Installed: " + modDisplayName(dst, folder), SK_OK };
     if (!g_saltyLoaderOk)
-        *st = { "On, but the SaltySD v2 plugin is missing!", SK_WARN };
+        *st = { "Installed, but the SaltySD v2 plugin is missing!", SK_WARN };
     return true;
 }
 
-// X under v2: every mod folder (and any v1 leftover) back to the repo.
+// X under v2: every mod folder (and any v1 leftover) back to the library.
 static bool v2AllOff(const GameProfile &gp, Status *st)
 {
     const std::vector<std::string> folders = v2ModFolders();
@@ -1808,7 +1806,7 @@ static bool v2AllOff(const GameProfile &gp, Status *st)
                 std::to_string(failed) + " failed.", SK_ERR };
         return false;
     }
-    *st = { "All mods off - game now runs vanilla.", SK_OK };
+    *st = { "All mods removed - game now runs vanilla.", SK_OK };
     return true;
 }
 
@@ -3103,12 +3101,13 @@ static void drawTopMods(const GameProfile &gp, const std::vector<ModEntry> &mods
     drawTopHeader("Mods");
 
     std::string activeName;
-    int looseCount = 0, activeCount = 0;
+    int looseCount = 0, activeCount = 0, installed = 0, offCount = 0;
     bool leftover = false;
     for (const ModEntry &m : mods) {
         if (m.active && !activeCount++) activeName = m.display;
         if (m.loose)    ++looseCount;
         if (m.leftover) leftover = true;
+        if (m.installed) { ++installed; if (m.off) ++offCount; }
     }
     if (activeCount > 1)
         activeName = fitText(activeName, 0.42f, 180) + " +" +
@@ -3130,7 +3129,7 @@ static void drawTopMods(const GameProfile &gp, const std::vector<ModEntry> &mods
         drawPill(364, 88, g_saltyGen == 2 ? "SaltySD v2" : "SaltySD", 0.4f,
                  T.info, CLR_DARK, true);
 
-    drawText(36, 118, 0.45f, T.muted, "Active");
+    drawText(36, 118, 0.45f, T.muted, g_saltyGen == 2 ? "On" : "Active");
     if (!activeName.empty())
         drawPill(96, 115, fitText(activeName, 0.42f, 240), 0.42f, CLR_GREEN, CLR_DARK, false);
     else
@@ -3140,8 +3139,16 @@ static void drawTopMods(const GameProfile &gp, const std::vector<ModEntry> &mods
     for (const ModEntry &m : mods)
         if (!m.loader) ++nMods;
     drawText(36, 150, 0.45f, T.muted, "Library");
-    drawText(104, 150, 0.45f, T.info,
-             std::to_string(nMods) + (nMods == 1 ? " mod" : " mods"));
+    if (g_saltyGen == 2) {
+        // Installed vs library, and how many the Tetra Menu has switched off.
+        std::string line = std::to_string(installed) + " installed";
+        if (offCount) line += " (" + std::to_string(offCount) + " off in-game)";
+        line += ", " + std::to_string(nMods - installed) + " stored";
+        drawText(104, 150, 0.45f, T.info, fitText(line, 0.45f, 260));
+    } else {
+        drawText(104, 150, 0.45f, T.info,
+                 std::to_string(nMods) + (nMods == 1 ? " mod" : " mods"));
+    }
 
     if (isSalty(gp) && !g_saltyLoaderOk) {
         roundRect(20, 188, 360, 26, 7, CLR_RED);
@@ -3430,7 +3437,7 @@ static void drawBottomMods(const GameProfile &gp, const std::vector<ModEntry> &m
 {
     drawBottomChrome(gp.title, cursor, (int)mods.size(),
                      g_saltyGen == 2
-                         ? G_A " On/Off  " G_X " All off  " G_Y " Tidy  " G_B " Back"
+                         ? G_A " Install/Remove  " G_X " Remove all  " G_Y " Tidy"
                          : G_A " Use  " G_X " Vanilla  " G_Y " Tidy  " G_B " Back",
                      true);
 
@@ -3446,14 +3453,18 @@ static void drawBottomMods(const GameProfile &gp, const std::vector<ModEntry> &m
 
         for (int i = start; i < end; ++i) {
             const ModEntry &m = mods[i];
+            const bool offIn = m.installed && m.off;   // Tetra Menu: off
             const char *badge = m.active   ? (g_saltyGen == 2 ? "ON" : "ACTIVE")
-                              : m.off      ? "OFF"
+                              : offIn      ? "OFF"
                               : m.leftover ? "OLD v1"
                               : m.loose    ? "LOOSE"
                               : m.loader   ? "SETUP" : "";
+            // A stored mod remembers being switched off in-game.
+            const std::string sub = (m.off && !m.installed) ? "off in-game" : "";
             drawListRow(i - start, m.display, i == cursor, badge,
-                        m.active ? CLR_GREEN : m.off ? CLR_YELLOW
-                                 : m.loader ? T.info : CLR_ORANGE);
+                        m.active ? CLR_GREEN : offIn ? CLR_YELLOW
+                                 : m.loader ? T.info : CLR_ORANGE,
+                        NULL, sub);
         }
 
         drawScrollbar(total, start);
