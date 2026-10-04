@@ -4,6 +4,45 @@ All notable changes to the 3DS Mod Manager. Versions before this repo was
 created (v3.0) are reconstructed from session notes — early entries are
 approximate.
 
+## v4.3 — 2026-10-04 — SaltySD v2
+
+- **SaltySD v2 support** (ha1vorsen's 3GX-plugin rewrite). The generation is
+  detected per game from what is installed; v1.2 setups behave exactly as
+  before.
+  - Mods live one per folder in `saltysd/smash/<mod>/`, any number at once.
+    A toggles the highlighted mod (stored -> on, on -> stored, Tetra-Menu
+    OFF -> on); X stores them all. Folder names are folded to ASCII (v2
+    reads them that way), with the real name kept in `modname.txt`.
+  - v2's scan cache (`saltysd/.saltysd-*`) is keyed on folder names only,
+    so it is dropped after every change the manager makes.
+  - The loader picker lists `.3gx` plugins (repo, SD root, `saltysd/`, mod
+    folders) next to `code.ips` files, tagged v1/v2, with a region hint
+    for the USA vs EUR/JPN builds. Installing one generation parks the
+    other's files in the repo root as `* (parked).*`, so Luma never applies
+    both. With v2 installed, a leftover `luma/titles/<TID>/code.ips` is
+    parked automatically (v2 itself warns this can cause issues).
+  - Warns when Rosalina's Plugin Loader is off (asked via `plg:ldr`).
+  - An old v1 layout left in `saltysd/smash` shows as OLD v1: A converts
+    it into a v2 mod folder in place, Y tidies it into the repo.
+  - Games with only a v2 plugin installed are discovered too.
+  - **Game-code check**: the manager asks AM for the cartridge's and the
+    update's title versions to work out which code the game really runs.
+    A cartridge newer than the installed update runs its OWN code (later
+    Smash carts, e.g. v35840 vs the 1.1.7 update's v35296), which the
+    official v2 release can't patch - it loads (blue flash) and silently
+    does nothing. Official release builds are recognised by SHA-256; when
+    one is installed on such a game the mod menu says so, the loader picker
+    tags them "won't patch your game", and its top screen shows which code
+    runs. Fix: build v2 from the cartridge's code.bin (see README).
+  - Switching back to v1 in the picker stores the v2 mod folders in the
+    repo (v1 can't read per-mod folders) instead of stranding them.
+- JPN Smash (`00040000000B8B00`) recognized out of the box.
+- `cro/` is recognised as Smash game data (an old v1 layout with one, like
+  Eclipse's, was misread as a v2 mod named "cro").
+- Fixed: picking the repo's pristine loader in the picker truncated it
+  (the file was copied onto itself).
+- Fixed: leaving a game's mod menu counted the loader row as a mod.
+
 ## v4.2 — 2026-07-04
 
 - The updater now asks the system to reconnect Wi-Fi before checking

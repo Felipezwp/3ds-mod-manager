@@ -1,23 +1,32 @@
 /*
- * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v4.0
+ * Universal 3DS Mod Manager  (LayeredFS + SaltySD hot-swapper)  v4.3
  * ---------------------------------------------------------------------------
  * Swaps the active mod for a game by MOVING folders between a central
  * per-title mod repository and the game's "active" location:
  *
  *   Stored (all games) : sdmc:/3ds/3dsmods/<TitleID>/<mod name>
  *   Active (most games): sdmc:/luma/titles/<TitleID>        (Luma LayeredFS)
- *   Active (Smash 3DS) : sdmc:/saltysd/smash                (SaltySD)
+ *   Active (Smash v1)  : sdmc:/saltysd/smash                (SaltySD v1.2)
+ *   Active (Smash v2)  : sdmc:/saltysd/smash/<mod name>     (SaltySD v2)
  *
  * Smash 3DS packs its data inside dt/ls archives in romfs, so plain LayeredFS
- * cannot replace individual files. SaltySD is a code.ips patch (applied by
- * Luma game patching from luma/titles/<SmashTID>/code.ips) that redirects the
- * game's file loads to sdmc:/saltysd/smash/. This app therefore:
- *   - swaps Smash mod folders in/out of saltysd/smash, unwrapping the mod's
- *     romfs/ subfolder on activation (SaltySD reads animcmd/, model/, ...
- *     directly from saltysd/smash) and re-wrapping it on return to the repo,
- *   - keeps the SaltySD loader (code.ips) alive in luma/titles/<SmashTID>/,
- *     self-healing from a pristine copy at the repo root (preferred) or any
- *     mod folder that carries one.
+ * cannot replace individual files. SaltySD redirects the game's file loads to
+ * the SD card. Two generations exist and are told apart by what is installed:
+ *
+ *   v1.2: a code.ips patch (Luma game patching, luma/titles/<SmashTID>/)
+ *         reading ONE mod straight out of saltysd/smash. The app swaps mod
+ *         folders in/out of saltysd/smash, unwrapping the mod's romfs/
+ *         subfolder on activation and re-wrapping it on return to the repo.
+ *   v2:   a 3GX plugin (Luma plugin loader, luma/plugins/<SmashTID>/) reading
+ *         MANY mods, one folder each under saltysd/smash/. Any number can be
+ *         on at once; a mod holding an is.disabled file (the in-game Tetra
+ *         Menu's toggle) is installed but off. v2 caches its mod scan in
+ *         saltysd/.saltysd-*, keyed on folder names only, so the app drops
+ *         that cache after every change it makes.
+ *
+ * The loader (either kind) self-heals from a pristine copy at the repo root
+ * (code.ips / saltysd.3gx). Installing one generation parks the other's files
+ * in the repo root, so Luma never applies both.
  *
  * Activating a stored mod (name-preserving, never deletes anything):
  *   1. If a mod is active, move it back into the repo under its own name.
@@ -59,7 +68,7 @@
 
 // Single source of truth for the app version (shown in the header, stamped
 // into the lookup log, and compared against GitHub release tags).
-#define APP_VER "4.2.0"
+#define APP_VER "4.3.0"
 
 // ---------------------------------------------------------------------------
 // Locations
@@ -69,17 +78,25 @@ static const char *MOD_REPO     = "sdmc:/3ds/3dsmods";
 static const char *MODMOON_REPO = "sdmc:/3ds/ModMoon";   // imported by Tidy
 static const char *SETTINGS_TXT = "sdmc:/3ds/3dsmods/settings.txt";
 
-// SaltySD-managed titles: their active mod lives in a fixed SD folder that the
-// SaltySD code patch reads, NOT in luma/titles. The loader (code.ips) must
-// stay in luma/titles/<TitleID>/ for Luma game patching to apply it.
-// USA and EUR Smash are built in; more title IDs (other regions / other
-// SaltySD games) can be added one-per-line in sdmc:/3ds/3dsmods/saltysd.txt.
+// SaltySD-managed titles: their active mods live in a fixed SD folder that
+// SaltySD reads, NOT in luma/titles. The v1.2 loader (code.ips) sits in
+// luma/titles/<TitleID>/ for Luma game patching; the v2 loader (a .3gx) sits
+// in luma/plugins/<TitleID>/ for the Luma plugin loader.
+// USA, EUR and JPN Smash are built in; more title IDs (other SaltySD games)
+// can be added one-per-line in sdmc:/3ds/3dsmods/saltysd.txt.
 static const char *SALTY_ACTIVE   = "sdmc:/saltysd/smash";
 static const char *SALTY_PARENT   = "sdmc:/saltysd";
 static const char *SALTY_LIST_TXT = "sdmc:/3ds/3dsmods/saltysd.txt";
+static const char *LUMA_PLUGINS   = "sdmc:/luma/plugins";
+static const char *SALTY_V1_FILE  = "code.ips";      // v1.2 loader name
+static const char *SALTY_V2_FILE  = "saltysd.3gx";   // v2 loader name
+static const char *SALTY_V2_OFF   = "is.disabled";   // v2 per-mod off switch
+static const char *SALTY_V2_INDEX = ".saltysd-";     // v2 scan cache prefix
+static const int   SALTY_V2_MAX   = 62;              // v2 mod folder limit
 static std::vector<std::string> g_saltyTids = {
     "00040000000EDF00",   // Super Smash Bros. (USA)
     "00040000000EE000",   // Super Smash Bros. (EUR)
+    "00040000000B8B00",   // Dairantou Smash Bros. (JPN)
 };
 
 // Per-folder marker files holding a mod's human-readable name (modname.txt
@@ -333,9 +350,14 @@ static std::string readFirstLine(const std::string &path)
     return s;
 }
 
-// Byte-for-byte file copy (used to restore the SaltySD loader).
+// Case-insensitive path equality (FAT32), so a copy never targets its source.
+static bool samePath(const std::string &a, const std::string &b);
+
+// Byte-for-byte file copy (used to restore the SaltySD loader). Copying a file
+// onto itself would truncate it, so that is a successful no-op.
 static bool copyFile(const std::string &src, const std::string &dst)
 {
+    if (samePath(src, dst)) return true;
     FILE *in = fopen(src.c_str(), "rb");
     if (!in) return false;
     FILE *out = fopen(dst.c_str(), "wb");
@@ -377,6 +399,33 @@ static bool iequals(const std::string &a, const std::string &b)
         if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i]))
             return false;
     return true;
+}
+
+static bool samePath(const std::string &a, const std::string &b)
+{
+    return iequals(a, b);
+}
+
+// Case-insensitive "does s end with suffix".
+static bool iendsWith(const std::string &s, const std::string &suffix)
+{
+    return s.size() >= suffix.size() &&
+           iequals(s.substr(s.size() - suffix.size()), suffix);
+}
+
+// Case-insensitive "does s contain needle".
+static bool icontains(const std::string &s, const std::string &needle)
+{
+    for (size_t i = 0; i + needle.size() <= s.size(); ++i)
+        if (iequals(s.substr(i, needle.size()), needle)) return true;
+    return false;
+}
+
+// Last path component.
+static std::string baseName(const std::string &path)
+{
+    const size_t slash = path.find_last_of('/');
+    return slash == std::string::npos ? path : path.substr(slash + 1);
 }
 
 // Case-insensitive "does s start with prefix".
@@ -477,6 +526,7 @@ struct GameProfile {
     std::string titleId;   // 16-hex Title ID
     int         modCount;  // total mods known for this game (UI stats)
     bool        hasActive; // a mod currently occupies the active location
+    int         saltyGen = 0; // SaltySD generation (1/2), 0 = not SaltySD
 };
 
 // A single mod discovered for a game.
@@ -486,12 +536,18 @@ struct ModEntry {
     bool        active = false; // occupies the active location right now
     bool        loose  = false; // legacy folder (luma/titles, ModMoon, ...)
     bool        loader = false; // pseudo-entry: opens the SaltySD loader picker
+    bool        off    = false; // SaltySD v2: installed, but is.disabled
+    bool        leftover = false; // SaltySD v2: old v1 layout in saltysd/smash
 };
 
 // A legacy-location folder eligible for Tidy.
 struct LooseItem {
     std::string path;      // full path of the folder
     std::string fallback;  // display name if it has no marker file
+    bool        leftover; // v1 layout loose in saltysd/smash (v2)
+
+    LooseItem(const std::string &p, const std::string &f, bool l = false)
+        : path(p), fallback(f), leftover(l) {}
 };
 
 // Status toast shown on the bottom screen.
@@ -564,28 +620,153 @@ static std::string modDisplayName(const std::string &folderPath,
 
 // Pick a repo folder name based on `base`, appending " (2)", " (3)", ... if a
 // folder of that name already exists.
-static std::string uniqueRepoFolder(const GameProfile &gp, const std::string &base)
+static std::string uniqueChild(const std::string &dir, const std::string &base)
 {
-    if (!isDir(repoModPath(gp, base))) return base;
+    if (!isDir(dir + "/" + base)) return base;
     for (int n = 2; ; ++n) {
         std::string cand = base + " (" + std::to_string(n) + ")";
-        if (!isDir(repoModPath(gp, cand))) return cand;
+        if (!isDir(dir + "/" + cand)) return cand;
     }
+}
+static std::string uniqueRepoFolder(const GameProfile &gp, const std::string &base)
+{
+    return uniqueChild(repoPath(gp), base);
+}
+
+// SaltySD v2 reads mod folder names as plain ASCII (max 63 chars), so names
+// that go into saltysd/smash are folded to that; the real name survives in
+// modname.txt.
+static std::string asciiFolderName(const std::string &in)
+{
+    std::string out;
+    for (char c : sanitizeName(in))
+        if ((unsigned char)c >= 0x20 && (unsigned char)c < 0x7F) out += c;
+    if (out.size() > 60) out.resize(60);
+    rtrim(out);
+    while (!out.empty() && out.back() == '.') out.pop_back();
+    rtrim(out);
+    if (out.empty()) out = "mod";
+    return out;
+}
+
+// Names of the regular files in `dir` whose name ends with `ext`. The SD
+// root is passed as "sdmc:" so that dir + "/" + name joins cleanly.
+static std::vector<std::string> filesWithExt(const std::string &dir,
+                                             const char *ext)
+{
+    std::vector<std::string> out;
+    if (DIR *dp = opendir(dir == "sdmc:" ? "sdmc:/" : dir.c_str())) {
+        struct dirent *ent;
+        while ((ent = readdir(dp)) != NULL) {
+            if (!iendsWith(ent->d_name, ext)) continue;
+            if (fileExists(dir + "/" + ent->d_name)) out.push_back(ent->d_name);
+        }
+        closedir(dp);
+    }
+    return out;
+}
+
+// True if both files hold identical bytes.
+static bool sameContent(const std::string &a, const std::string &b)
+{
+    FILE *fa = fopen(a.c_str(), "rb");
+    if (!fa) return false;
+    FILE *fb = fopen(b.c_str(), "rb");
+    if (!fb) { fclose(fa); return false; }
+    static u8 ba[16 * 1024], bb[16 * 1024];
+    bool same = true;
+    while (same) {
+        const size_t na = fread(ba, 1, sizeof(ba), fa);
+        const size_t nb = fread(bb, 1, sizeof(bb), fb);
+        if (na != nb || memcmp(ba, bb, na) != 0) same = false;
+        if (na == 0) break;
+    }
+    fclose(fa);
+    fclose(fb);
+    return same;
 }
 
 // ---------------------------------------------------------------------------
-// SaltySD loader upkeep
+// SaltySD loader upkeep (both generations)
 // ---------------------------------------------------------------------------
+
+static std::string pluginDir(const GameProfile &gp)
+{
+    return std::string(LUMA_PLUGINS) + "/" + gp.titleId;
+}
+static std::string pristineV1(const GameProfile &gp)
+{
+    return repoPath(gp) + "/" + SALTY_V1_FILE;
+}
+static std::string pristineV2(const GameProfile &gp)
+{
+    return repoPath(gp) + "/" + SALTY_V2_FILE;
+}
+
+// Which SaltySD generation this title runs: v2 when a plugin is installed
+// for it, or when the repo's pristine copy says v2 was chosen (installing
+// v1 parks that copy, so it only exists while v2 is the choice).
+static int saltyGenOf(const GameProfile &gp)
+{
+    if (!isSalty(gp)) return 0;
+    if (!filesWithExt(pluginDir(gp), ".3gx").empty()) return 2;
+    return fileExists(pristineV2(gp)) ? 2 : 1;
+}
+
+// Generation of the game whose mod menu is open (draw code reads this
+// every frame, so it is not re-probed there).
+static int g_saltyGen = 0;
+
+// Move a loader file out of Luma's reach into the repo root, renamed
+// "<stem> (parked).<ext>" so it no longer counts as the pristine copy but
+// still shows up in the loader picker. Returns true if something moved.
+static bool parkFile(const GameProfile &gp, const std::string &path)
+{
+    if (!fileExists(path)) return false;
+    const std::string name = baseName(path);
+    const size_t dot  = name.find_last_of('.');
+    const std::string stem = dot == std::string::npos ? name : name.substr(0, dot);
+    const std::string ext  = dot == std::string::npos ? "" : name.substr(dot);
+    mkdirs(repoPath(gp));
+    std::string dst = repoPath(gp) + "/" + stem + " (parked)" + ext;
+    for (int n = 2; fileExists(dst); ++n)
+        dst = repoPath(gp) + "/" + stem + " (parked " + std::to_string(n) + ")" + ext;
+    return rename(path.c_str(), dst.c_str()) == 0;
+}
 
 // Cached result of the last loader check, shown in the mod-menu header.
 static bool g_saltyLoaderOk = true;
 
-// Ensure luma/titles/<SmashTID>/code.ips exists: SaltySD cannot boot without
-// it. Self-heals by copying a code.ips from the active folder or any repo mod
-// (the user's mod folders each carry one). Returns true if the loader exists.
+// Set when the last loader check parked a v1 code.ips (shown as a toast).
+static bool g_saltyParkedV1 = false;
+
+// Ensure the active generation's loader is installed: SaltySD cannot boot
+// without it. v2 restores the plugin from the repo's pristine saltysd.3gx and
+// keeps any v1 code.ips out of luma/titles (Luma would apply it under the
+// plugin). v1 self-heals code.ips from the repo root, the active folder or
+// any repo mod that carries one. Returns true if the loader exists.
 static bool ensureSaltyLoader(const GameProfile &gp)
 {
+    g_saltyParkedV1 = false;
     if (!isSalty(gp)) return true;
+
+    if (saltyGenOf(gp) == 2) {
+        bool ok = !filesWithExt(pluginDir(gp), ".3gx").empty();
+        if (!ok && fileExists(pristineV2(gp))) {
+            mkdirs(pluginDir(gp));
+            ok = copyFile(pristineV2(gp),
+                          pluginDir(gp) + "/" + SALTY_V2_FILE);
+        }
+        const std::string v1 = lumaPath(gp) + "/" + SALTY_V1_FILE;
+        if (fileExists(v1)) {
+            // A byte-identical pristine copy already backs it up.
+            if (fileExists(pristineV1(gp)) && sameContent(v1, pristineV1(gp)))
+                g_saltyParkedV1 = remove(v1.c_str()) == 0;
+            else
+                g_saltyParkedV1 = parkFile(gp, v1);
+        }
+        return ok;
+    }
 
     const std::string loaderDir = lumaPath(gp);
     const std::string loader    = loaderDir + "/code.ips";
@@ -671,6 +852,214 @@ static void saltyRewrap(const std::string &folder)
     mkdirs(wrap);
     for (const std::string &n : dirs)
         rename((folder + "/" + n).c_str(), (wrap + "/" + n).c_str());
+}
+
+// ---------------------------------------------------------------------------
+// SaltySD v2 layout
+// ---------------------------------------------------------------------------
+// v2 treats every folder in saltysd/smash as one mod. A v1 setup left there
+// (data folders like animcmd/ and ui/ sitting directly in saltysd/smash)
+// would be misread as mods named "animcmd", "ui", ... so it is recognised by
+// Smash's top-level romfs folder names and offered for migration instead.
+
+static const char *SMASH_DATA_DIRS[] = {
+    "romfs", "animcmd", "fighter", "ui", "stage", "sound", "menu", "param", "cro",
+    "effect", "item", "camera", "pokemon", "assist", "enemy", "minigame",
+    "model", "shader", "common", "motion", "sp", "snd", "movie",
+};
+
+static bool isSmashDataDir(const std::string &name)
+{
+    for (const char *d : SMASH_DATA_DIRS)
+        if (iequals(name, d)) return true;
+    return false;
+}
+
+static bool hasMarker(const std::string &folder)
+{
+    return fileExists(folder + "/" + MARKER_FILE) ||
+           fileExists(folder + "/" + ALT_MARKER);
+}
+
+// Entries in saltysd/smash that belong to an old single-mod (v1) layout: its
+// data folders plus loose files (markers, readmes). Empty when there is none.
+static std::vector<std::string> saltyLeftover()
+{
+    std::vector<std::string> names;
+    bool data = false;
+    if (DIR *dp = opendir(SALTY_ACTIVE)) {
+        struct dirent *ent;
+        while ((ent = readdir(dp)) != NULL) {
+            const std::string n = ent->d_name;
+            if (n == "." || n == ".." || n[0] == '.') continue;
+            const std::string full = std::string(SALTY_ACTIVE) + "/" + n;
+            if (isDir(full)) {
+                if (!isSmashDataDir(n)) continue;   // a v2 mod folder
+                data = true;
+            } else if (iequals(n, "saltysd.log") || iequals(n, SALTY_V2_OFF)) {
+                continue;                           // v2's own files
+            }
+            names.push_back(n);
+        }
+        closedir(dp);
+    }
+    if (!data && !hasMarker(SALTY_ACTIVE)) names.clear();
+    return names;
+}
+
+// v2 mod folders currently in saltysd/smash (names only).
+static std::vector<std::string> v2ModFolders()
+{
+    std::vector<std::string> names;
+    if (DIR *dp = opendir(SALTY_ACTIVE)) {
+        struct dirent *ent;
+        while ((ent = readdir(dp)) != NULL) {
+            const std::string n = ent->d_name;
+            if (n == "." || n == ".." || n[0] == '.') continue;
+            if (isSmashDataDir(n)) continue;
+            if (isDir(std::string(SALTY_ACTIVE) + "/" + n)) names.push_back(n);
+        }
+        closedir(dp);
+    }
+    return names;
+}
+
+// Move the v1 leftover out of saltysd/smash into `dst` (created). Returns
+// true only if every entry moved.
+static bool moveLeftover(const std::string &dst)
+{
+    const std::vector<std::string> names = saltyLeftover();
+    mkdirs(dst);
+    bool ok = true;
+    for (const std::string &n : names) {
+        const std::string from = std::string(SALTY_ACTIVE) + "/" + n;
+        if (rename(from.c_str(), (dst + "/" + n).c_str()) != 0) ok = false;
+    }
+    return ok;
+}
+
+// v2 caches its mod scan in saltysd/.saltysd-<hash>, keyed on folder names
+// and on/off flags only - swapping a mod's contents under the same name
+// would load the stale scan. Dropping the cache makes the next boot rescan.
+static void dropSaltyIndex()
+{
+    std::vector<std::string> doomed;
+    if (DIR *dp = opendir(SALTY_PARENT)) {
+        struct dirent *ent;
+        while ((ent = readdir(dp)) != NULL)
+            if (istartsWith(ent->d_name, SALTY_V2_INDEX))
+                doomed.push_back(std::string(SALTY_PARENT) + "/" + ent->d_name);
+        closedir(dp);
+    }
+    for (const std::string &p : doomed) remove(p.c_str());
+}
+
+// Is Luma's plugin loader switched on? 1 = on, 0 = off, -1 = unknown (no
+// Rosalina plg:ldr port, e.g. old Luma or an emulator). Asks the port
+// directly - IsPluginLoaderEnabled is command 2.
+static int pluginLoaderState()
+{
+    Handle h;
+    if (R_FAILED(svcConnectToPort(&h, "plg:ldr"))) return -1;
+    u32 *cmd = getThreadCommandBuffer();
+    cmd[0] = IPC_MakeHeader(2, 0, 0);
+    int state = -1;
+    if (R_SUCCEEDED(svcSendSyncRequest(h)) && R_SUCCEEDED((Result)cmd[1]))
+        state = cmd[2] ? 1 : 0;
+    svcCloseHandle(h);
+    return state;
+}
+static int g_plgState = -1;   // checked when a v2 game's menu opens
+
+// ---------------------------------------------------------------------------
+// Which code does the game actually run? SaltySD patches the game's code and
+// refuses (silently) when it isn't the build it was made for. A cartridge
+// whose title version is newer than the installed update runs its OWN code
+// and ignores the update's - later Smash carts ship such a revision - and
+// the official v2 release only matches the 1.1.7 update's code.
+// ---------------------------------------------------------------------------
+struct CodeSource {
+    bool known  = false;   // the title was found at all
+    bool cart   = false;   // runs the cartridge's code
+    bool hasUpd = false;
+    u16  cartVer = 0, updVer = 0;
+};
+
+static bool titleVersion(FS_MediaType media, u64 tid, u16 *ver)
+{
+    AM_TitleEntry e;
+    if (R_FAILED(AM_GetTitleInfo(media, 1, &tid, &e))) return false;
+    *ver = e.version;
+    return true;
+}
+
+static CodeSource codeSource(const GameProfile &gp)
+{
+    CodeSource cs;
+    const u64 tid = strtoull(gp.titleId.c_str(), NULL, 16);
+    const u64 upd = tid | 0x0000000E00000000ULL;
+    bool inserted = false;
+    const bool cart = R_SUCCEEDED(FSUSER_CardSlotIsInserted(&inserted)) &&
+                      inserted && titleVersion(MEDIATYPE_GAME_CARD, tid, &cs.cartVer);
+    u16 baseVer = 0;
+    cs.hasUpd = titleVersion(MEDIATYPE_SD, upd, &cs.updVer);
+    cs.known  = cart || titleVersion(MEDIATYPE_SD, tid, &baseVer);
+    cs.cart   = cart && (!cs.hasUpd || cs.cartVer > cs.updVer);
+    return cs;
+}
+
+// Official SaltySD v2 release builds (ha1vorsen/SaltySD, Smash4v2.0). Both
+// are built from the 1.1.7 UPDATE's code; custom builds are unknown here.
+static const char *SALTY_V2_RELEASES[] = {
+    "af6381718d324bf342d66f892667ecfd07224f2c217c212b55765e51fa99da63",  // usa
+    "e58d168ab8346b5276207ea2f7ec8844e4e1f1c77ffbad707694e93d9fba6574",  // eur_jpn
+};
+
+static std::string fileSha256(const std::string &path)
+{
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) return "";
+    std::vector<u8> data;
+    static u8 buf[16 * 1024];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        data.insert(data.end(), buf, buf + n);
+    fclose(f);
+    unsigned char hash[32];
+    mbedtls_sha256(data.data(), data.size(), hash, 0);
+    char hex[65];
+    for (int i = 0; i < 32; ++i) snprintf(hex + i * 2, 3, "%02x", hash[i]);
+    return hex;
+}
+
+static bool isOfficialV2(const std::string &path)
+{
+    const std::string h = fileSha256(path);
+    for (const char *r : SALTY_V2_RELEASES)
+        if (h == r) return true;
+    return false;
+}
+
+// True when this code can't be what the official release patches: the
+// cartridge's own code, or a base game with no update installed.
+static bool releaseCantPatch(const CodeSource &cs)
+{
+    return cs.known && (cs.cart || !cs.hasUpd);
+}
+
+// Checked when a v2 game's menu opens: an official release plugin is
+// installed but the game runs code it can't patch.
+static CodeSource g_codeSrc;
+static bool       g_v2Mismatch = false;
+
+static void refreshV2Check(const GameProfile &gp)
+{
+    g_v2Mismatch = false;
+    if (!isSalty(gp)) return;
+    g_codeSrc = codeSource(gp);
+    if (!releaseCantPatch(g_codeSrc)) return;
+    for (const std::string &f : filesWithExt(pluginDir(gp), ".3gx"))
+        if (isOfficialV2(pluginDir(gp) + "/" + f)) g_v2Mismatch = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1093,6 +1482,10 @@ static std::vector<LooseItem> collectLoose(const GameProfile &gp)
     if (isSalty(gp) && isDir(lumaPath(gp) + "/romfs"))
         items.push_back({ lumaPath(gp), "Legacy active" });
 
+    // Under v2, a v1 single-mod layout left loose in saltysd/smash.
+    if (saltyGenOf(gp) == 2 && !saltyLeftover().empty())
+        items.push_back({ SALTY_ACTIVE, "Previous", true });
+
     // ModMoon slots for this title.
     const std::string mm = modmoonPath(gp);
     if (DIR *mp = opendir(mm.c_str())) {
@@ -1131,10 +1524,23 @@ static std::vector<LooseItem> collectLoose(const GameProfile &gp)
 static std::vector<ModEntry> scanMods(const GameProfile &gp)
 {
     std::vector<ModEntry> mods;
+    const bool v2 = saltyGenOf(gp) == 2;
 
-    // 1. The currently active mod, if present (an empty folder is not one).
+    // 1a. SaltySD v2: every mod folder in saltysd/smash, on or off.
+    if (v2) {
+        for (const std::string &n : v2ModFolders()) {
+            ModEntry e;
+            e.path    = std::string(SALTY_ACTIVE) + "/" + n;
+            e.off     = fileExists(e.path + "/" + SALTY_V2_OFF);
+            e.active  = !e.off;
+            e.display = modDisplayName(e.path, n);
+            mods.push_back(e);
+        }
+    }
+
+    // 1b. The currently active mod, if present (an empty folder is not one).
     const std::string ap = activePath(gp);
-    if (dirNonEmpty(ap) && !(isSalty(gp) && ap == lumaPath(gp))) {
+    if (!v2 && dirNonEmpty(ap) && !(isSalty(gp) && ap == lumaPath(gp))) {
         ModEntry e;
         e.path    = ap;
         e.active  = true;
@@ -1167,12 +1573,14 @@ static std::vector<ModEntry> scanMods(const GameProfile &gp)
         e.path    = li.path;
         e.active  = false;
         e.loose   = true;
+        e.leftover = li.leftover;
         e.display = modDisplayName(li.path, li.fallback);
         mods.push_back(e);
     }
 
     std::sort(mods.begin(), mods.end(), [](const ModEntry &a, const ModEntry &b) {
         if (a.active != b.active) return a.active;   // active first
+        if (a.off != b.off) return a.off;             // then v2 mods set off
         return a.display < b.display;                 // then alphabetical
     });
 
@@ -1208,6 +1616,11 @@ static std::vector<GameProfile> discoverProfiles()
         if (!dirNonEmpty(std::string(LUMA_TITLES) + "/" + name)) continue;
         addId(id);
     }
+
+    // A SaltySD v2 setup may leave nothing in luma/titles at all.
+    for (const std::string &id : g_saltyTids)
+        if (!filesWithExt(std::string(LUMA_PLUGINS) + "/" + id, ".3gx").empty())
+            addId(id);
 
     for (const char *root : { MOD_REPO, MODMOON_REPO }) {
         if (DIR *rp = opendir(root)) {
@@ -1278,8 +1691,126 @@ static void refreshStats(GameProfile &gp)
     for (const ModEntry &e : m)
         if (!e.loader) ++gp.modCount;
     gp.hasActive = !m.empty() && m.front().active;  // active sorts first
+    gp.saltyGen  = saltyGenOf(gp);
 }
 
+
+// ---------------------------------------------------------------------------
+// SaltySD v2 actions. Any number of mods can be on at once, so A toggles the
+// highlighted mod instead of swapping:
+//   stored/loose mod -> moved into saltysd/smash/<name>/ (romfs/ unwrapped)
+//   on mod           -> moved back to the repo (re-wrapped)
+//   off mod          -> its is.disabled marker is removed (back on)
+//   v1 leftover      -> gathered in place into its own mod folder
+// Every change drops v2's scan cache.
+// ---------------------------------------------------------------------------
+
+// Move a mod out of saltysd/smash into the repo under its display name.
+static bool v2Store(const GameProfile &gp, const std::string &path)
+{
+    mkdirs(repoPath(gp));
+    remove((path + "/" + SALTY_V2_OFF).c_str());   // a stored mod is just stored
+    const std::string name   = sanitizeName(modDisplayName(path, baseName(path)));
+    const std::string folder = repoModPath(gp, uniqueRepoFolder(gp, name));
+    if (rename(path.c_str(), folder.c_str()) != 0) return false;
+    saltyRewrap(folder);
+    return true;
+}
+
+static bool v2Toggle(const GameProfile &gp, const ModEntry &target, Status *st)
+{
+    if (target.off) {
+        if (remove((target.path + "/" + SALTY_V2_OFF).c_str()) != 0) {
+            *st = { "Could not switch the mod back on.", SK_ERR };
+            return false;
+        }
+        dropSaltyIndex();
+        *st = { "On: " + target.display, SK_OK };
+        return true;
+    }
+
+    if (target.active) {
+        if (!v2Store(gp, target.path)) {
+            *st = { "Could not turn the mod off.", SK_ERR };
+            return false;
+        }
+        dropSaltyIndex();
+        *st = { "Off (stored): " + target.display, SK_OK };
+        return true;
+    }
+
+    if ((int)v2ModFolders().size() >= SALTY_V2_MAX) {
+        *st = { "SaltySD v2 holds at most 62 mods.", SK_ERR };
+        return false;
+    }
+    mkdirs(SALTY_ACTIVE);
+
+    // Stored mods keep their repo folder name; loose ones use their display
+    // name. Either way v2 needs a plain-ASCII folder name.
+    const std::string base   = target.loose ? sanitizeName(target.display)
+                                            : baseName(target.path);
+    const std::string folder = uniqueChild(SALTY_ACTIVE, asciiFolderName(base));
+    const std::string dst    = std::string(SALTY_ACTIVE) + "/" + folder;
+
+    if (target.leftover) {
+        if (!moveLeftover(dst)) {
+            *st = { "Could not convert the old v1 layout.", SK_ERR };
+            return false;
+        }
+    } else if (rename(target.path.c_str(), dst.c_str()) != 0) {
+        *st = { "Could not turn the mod on.", SK_ERR };
+        return false;
+    }
+    saltyUnwrap(dst);
+    remove((dst + "/" + SALTY_V2_OFF).c_str());
+    // Folding the name to ASCII must not lose it: record the original.
+    if (!hasMarker(dst) && folder != base) {
+        if (FILE *f = fopen((dst + "/" + MARKER_FILE).c_str(), "w")) {
+            fprintf(f, "%s\n", base.c_str());
+            fclose(f);
+        }
+    }
+
+    invalidateLumaList();   // a loose luma/titles folder may have moved
+    dropSaltyIndex();
+    g_saltyLoaderOk = ensureSaltyLoader(gp);
+    *st = { "On: " + modDisplayName(dst, folder), SK_OK };
+    if (!g_saltyLoaderOk)
+        *st = { "On, but the SaltySD v2 plugin is missing!", SK_WARN };
+    return true;
+}
+
+// X under v2: every mod folder (and any v1 leftover) back to the repo.
+static bool v2AllOff(const GameProfile &gp, Status *st)
+{
+    const std::vector<std::string> folders = v2ModFolders();
+    const bool leftover = !saltyLeftover().empty();
+    if (folders.empty() && !leftover) {
+        *st = { "No mods installed - already vanilla.", SK_WARN };
+        return false;
+    }
+
+    int moved = 0, failed = 0;
+    for (const std::string &n : folders)
+        v2Store(gp, std::string(SALTY_ACTIVE) + "/" + n) ? ++moved : ++failed;
+    if (leftover) {
+        mkdirs(repoPath(gp));
+        const std::string name =
+            sanitizeName(modDisplayName(SALTY_ACTIVE, FALLBACK_NAME));
+        const std::string dst = repoModPath(gp, uniqueRepoFolder(gp, name));
+        if (moveLeftover(dst)) { saltyRewrap(dst); ++moved; }
+        else ++failed;
+    }
+    dropSaltyIndex();
+
+    if (failed) {
+        *st = { "Stored " + std::to_string(moved) + ", " +
+                std::to_string(failed) + " failed.", SK_ERR };
+        return false;
+    }
+    *st = { "All mods off - game now runs vanilla.", SK_OK };
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Activate a stored mod. Two metadata-only moves, no deletion:
@@ -1291,6 +1822,8 @@ static void refreshStats(GameProfile &gp)
 static bool activateMod(const GameProfile &gp, const ModEntry &target,
                         Status *st)
 {
+    if (saltyGenOf(gp) == 2) return v2Toggle(gp, target, st);
+
     if (target.active) {
         *st = { "That mod is already active.", SK_WARN };
         return false;
@@ -1339,6 +1872,8 @@ static bool activateMod(const GameProfile &gp, const ModEntry &target,
 // ---------------------------------------------------------------------------
 static bool disableMod(const GameProfile &gp, Status *st)
 {
+    if (saltyGenOf(gp) == 2) return v2AllOff(gp, st);
+
     const std::string ap = activePath(gp);
     if (!isDir(ap) || (isSalty(gp) && ap == lumaPath(gp))) {
         *st = { "No active mod - already vanilla.", SK_WARN };
@@ -1381,6 +1916,17 @@ static bool tidyLooseMods(const GameProfile &gp, Status *st)
     for (const LooseItem &li : loose) {
         std::string disp   = sanitizeName(modDisplayName(li.path, li.fallback));
         std::string folder = uniqueRepoFolder(gp, disp);
+        if (li.leftover) {
+            // Only the v1 entries leave; v2 mod folders stay installed.
+            if (moveLeftover(repoModPath(gp, folder))) {
+                saltyRewrap(repoModPath(gp, folder));
+                dropSaltyIndex();
+                ++moved;
+            } else {
+                ++failed;
+            }
+            continue;
+        }
         if (rename(li.path.c_str(), repoModPath(gp, folder).c_str()) == 0) {
             if (isSalty(gp)) saltyRewrap(repoModPath(gp, folder));
             ++moved;
@@ -1959,36 +2505,87 @@ static void startUpdateCheck(bool silent = false)
 }
 
 // ---------------------------------------------------------------------------
-// SaltySD loader picker. The code.ips must match the game's exact revision
-// (a mismatch data-aborts at boot), and different mod packs ship different
-// builds - so let the user choose among every copy on the card.
+// SaltySD loader picker. Lists both generations: v1.2 code.ips patches (which
+// must match the game's exact revision - a mismatch data-aborts at boot) and
+// v2 .3gx plugins (one build for USA, one shared by EUR/JPN). Installing one
+// generation parks the other, so the picker is also how you switch.
 // ---------------------------------------------------------------------------
+static bool isV2Loader(const ModEntry &e) { return iendsWith(e.path, ".3gx"); }
+
+// Region hint from a v2 release's file name (saltysd_usa.3gx /
+// saltysd_eur_jpn.3gx) - flags a build that likely targets another region.
+static std::string regionHint(const GameProfile &gp, const std::string &file)
+{
+    const bool usaGame = iequals(gp.titleId, "00040000000EDF00");
+    if (icontains(file, "usa") && !usaGame)
+        return "  [USA build!]";
+    if ((icontains(file, "eur") || icontains(file, "jpn")) && usaGame)
+        return "  [EUR/JPN build!]";
+    return "";
+}
+
 static std::vector<ModEntry> scanLoaders(const GameProfile &gp)
 {
     std::vector<ModEntry> out;
+    const bool cantPatch = releaseCantPatch(g_codeSrc);
     auto add = [&](const std::string &path, const std::string &name) {
         if (!fileExists(path)) return;
+        for (const ModEntry &e : out)
+            if (samePath(e.path, path)) return;
         ModEntry e;
         e.path    = path;
         e.display = name;
+        if (cantPatch && iendsWith(path, ".3gx") && isOfficialV2(path))
+            e.display += "  [won't patch your game]";
         out.push_back(e);
     };
-    add(repoPath(gp) + "/code.ips", "Pristine copy (repo root)");
-    add(activePath(gp) + "/code.ips",
-        "From active: " + modDisplayName(activePath(gp), "mod"));
-    if (DIR *dp = opendir(repoPath(gp).c_str())) {
+
+    // Repo root: pristine copies first, then anything parked or dropped there.
+    const std::string rp = repoPath(gp);
+    add(pristineV2(gp), "Pristine v2 plugin (repo root)");
+    add(pristineV1(gp), "Pristine code.ips (repo root)");
+    for (const char *ext : { ".3gx", ".ips" })
+        for (const std::string &f : filesWithExt(rp, ext))
+            add(rp + "/" + f, f + regionHint(gp, f));
+
+    // Where a downloaded v2 release usually lands.
+    for (const char *dir : { "sdmc:", SALTY_PARENT, MOD_REPO })
+        for (const std::string &f : filesWithExt(dir, ".3gx"))
+            add(std::string(dir) + "/" + f, f + regionHint(gp, f));
+
+    if (saltyGenOf(gp) == 1)
+        add(activePath(gp) + "/code.ips",
+            "From active: " + modDisplayName(activePath(gp), "mod"));
+    if (DIR *dp = opendir(rp.c_str())) {
         struct dirent *ent;
         while ((ent = readdir(dp)) != NULL) {
             if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, ".."))
                 continue;
-            const std::string folder = repoPath(gp) + "/" + ent->d_name;
+            const std::string folder = rp + "/" + ent->d_name;
             if (!isDir(folder)) continue;
-            add(folder + "/code.ips",
-                "From mod: " + modDisplayName(folder, ent->d_name));
+            const std::string mod = modDisplayName(folder, ent->d_name);
+            add(folder + "/code.ips", "From mod: " + mod);
+            for (const std::string &f : filesWithExt(folder, ".3gx"))
+                add(folder + "/" + f, "From mod: " + mod + " (" + f + ")");
         }
         closedir(dp);
     }
     return out;
+}
+
+// Park every installed v2 plugin for this title (dropping copies identical to
+// the pristine one) and the pristine saltysd.3gx itself, so v1 takes over.
+static void parkV2(const GameProfile &gp)
+{
+    const std::string dir = pluginDir(gp);
+    for (const std::string &f : filesWithExt(dir, ".3gx")) {
+        const std::string p = dir + "/" + f;
+        if (fileExists(pristineV2(gp)) && sameContent(p, pristineV2(gp)))
+            remove(p.c_str());
+        else
+            parkFile(gp, p);
+    }
+    parkFile(gp, pristineV2(gp));
 }
 
 // Install the chosen loader where Luma applies it, and refresh the pristine
@@ -1996,16 +2593,56 @@ static std::vector<ModEntry> scanLoaders(const GameProfile &gp)
 static bool installLoader(const GameProfile &gp, const ModEntry &cand,
                           Status *st)
 {
-    mkdirs(lumaPath(gp));
-    const bool ok = copyFile(cand.path, lumaPath(gp) + "/code.ips");
-    copyFile(cand.path, repoPath(gp) + "/code.ips");
+    mkdirs(repoPath(gp));
+    const bool wasV2 = saltyGenOf(gp) == 2;
+    bool ok;
+    if (isV2Loader(cand)) {
+        // Luma loads one plugin per title: clear out any other build first.
+        // (Pristine first: parking the candidate itself would lose it.)
+        if (!samePath(cand.path, pristineV2(gp)))
+            parkFile(gp, pristineV2(gp));
+        copyFile(cand.path, pristineV2(gp));
+        const std::string dir = pluginDir(gp);
+        for (const std::string &f : filesWithExt(dir, ".3gx")) {
+            const std::string p = dir + "/" + f;
+            if (sameContent(p, pristineV2(gp))) remove(p.c_str());
+            else parkFile(gp, p);
+        }
+        mkdirs(dir);
+        ok = copyFile(pristineV2(gp), dir + "/" + SALTY_V2_FILE);
+        ensureSaltyLoader(gp);   // parks the v1 code.ips
+        dropSaltyIndex();
+    } else {
+        mkdirs(lumaPath(gp));
+        ok = copyFile(cand.path, lumaPath(gp) + "/" + SALTY_V1_FILE);
+        copyFile(cand.path, pristineV1(gp));
+        if (ok && wasV2) {
+            parkV2(gp);
+            // v1 reads one mod straight out of saltysd/smash; v2's per-mod
+            // folders would be invisible to it, so they go back to the repo.
+            for (const std::string &n : v2ModFolders())
+                v2Store(gp, std::string(SALTY_ACTIVE) + "/" + n);
+            dropSaltyIndex();
+        }
+    }
     invalidateLumaList();
     if (!ok) {
         *st = { "Could not install the loader.", SK_ERR };
         return false;
     }
     g_saltyLoaderOk = true;
-    *st = { "Loader installed: " + cand.display, SK_OK };
+    g_saltyGen      = saltyGenOf(gp);
+    refreshV2Check(gp);
+    if (g_saltyGen == 2) {
+        g_plgState = pluginLoaderState();
+        *st = g_v2Mismatch
+            ? Status{ "Installed, but this build can't patch your game", SK_WARN }
+            : g_plgState == 0
+            ? Status{ "v2 installed - now enable Rosalina's Plugin Loader", SK_WARN }
+            : Status{ "SaltySD v2 installed: " + cand.display, SK_OK };
+    } else {
+        *st = { "SaltySD v1 installed - pick a mod to activate", SK_OK };
+    }
     return true;
 }
 
@@ -2449,7 +3086,8 @@ static void drawTopGames(const std::vector<GameProfile> &profiles, int cursor)
     else
         x += drawPill(36, 122, "VANILLA", 0.42f, T.panel2, T.text, false) + 10;
     if (isSalty(gp))
-        x += drawPill(x, 122, "SaltySD", 0.42f, T.info, CLR_DARK, false) + 10;
+        x += drawPill(x, 122, gp.saltyGen == 2 ? "SaltySD v2" : "SaltySD",
+                      0.42f, T.info, CLR_DARK, false) + 10;
     drawText(x, 124, 0.45f, T.info,
              std::to_string(gp.modCount) + (gp.modCount == 1 ? " mod" : " mods"));
 
@@ -2465,11 +3103,16 @@ static void drawTopMods(const GameProfile &gp, const std::vector<ModEntry> &mods
     drawTopHeader("Mods");
 
     std::string activeName;
-    int looseCount = 0;
+    int looseCount = 0, activeCount = 0;
+    bool leftover = false;
     for (const ModEntry &m : mods) {
-        if (m.active) activeName = m.display;
-        if (m.loose)  ++looseCount;
+        if (m.active && !activeCount++) activeName = m.display;
+        if (m.loose)    ++looseCount;
+        if (m.leftover) leftover = true;
     }
+    if (activeCount > 1)
+        activeName = fitText(activeName, 0.42f, 180) + " +" +
+                     std::to_string(activeCount - 1);
 
     drawCard(20, 52, 360, 126);
     const C2D_Image *ic = gameIcon(gp.titleId);
@@ -2484,7 +3127,8 @@ static void drawTopMods(const GameProfile &gp, const std::vector<ModEntry> &mods
     drawText(tx, 92, 0.42f, T.muted, "Title ID");
     drawText(tx + 68, 92, 0.42f, T.secondary, gp.titleId);
     if (isSalty(gp))   // right-aligned at the card edge, clear of the ID text
-        drawPill(364, 88, "SaltySD", 0.4f, T.info, CLR_DARK, true);
+        drawPill(364, 88, g_saltyGen == 2 ? "SaltySD v2" : "SaltySD", 0.4f,
+                 T.info, CLR_DARK, true);
 
     drawText(36, 118, 0.45f, T.muted, "Active");
     if (!activeName.empty())
@@ -2502,7 +3146,23 @@ static void drawTopMods(const GameProfile &gp, const std::vector<ModEntry> &mods
     if (isSalty(gp) && !g_saltyLoaderOk) {
         roundRect(20, 188, 360, 26, 7, CLR_RED);
         drawTextCenter(200, 193, 0.42f, CLR_DARK,
-                       "SaltySD loader missing: luma/titles/.../code.ips");
+                       g_saltyGen == 2
+                           ? "SaltySD v2 plugin missing - see 'SaltySD loader...'"
+                           : "SaltySD loader missing: luma/titles/.../code.ips");
+    } else if (isSalty(gp) && g_saltyGen == 2 && g_v2Mismatch) {
+        roundRect(20, 188, 360, 26, 7, CLR_RED);
+        drawTextCenter(200, 193, 0.42f, CLR_DARK,
+                       g_codeSrc.cart
+                           ? "Release v2 can't patch this cart's code - see README"
+                           : "Release v2 needs the 1.1.7 update installed");
+    } else if (isSalty(gp) && g_saltyGen == 2 && g_plgState == 0) {
+        roundRect(20, 188, 360, 26, 7, CLR_RED);
+        drawTextCenter(200, 193, 0.42f, CLR_DARK,
+                       "Plugin Loader off - turn on in Rosalina (L+Down+SEL)");
+    } else if (leftover) {
+        roundRect(20, 188, 360, 26, 7, CLR_ORANGE);
+        drawTextCenter(200, 193, 0.42f, CLR_DARK,
+                       "Old v1 layout in saltysd/smash - " G_A " convert, " G_Y " tidy");
     } else if (looseCount > 0) {
         roundRect(20, 188, 360, 26, 7, CLR_ORANGE);
         drawTextCenter(200, 193, 0.42f, CLR_DARK,
@@ -2535,15 +3195,31 @@ static void drawUpdateNotes()
 static void drawTopLoader()
 {
     drawTopHeader("SaltySD loader");
-    drawCard(20, 52, 360, 132);
-    drawText(36, 64, 0.55f, CLR_WHITE, "Pick the code.ips patch");
-    drawText(36, 92, 0.42f, T.muted,
-             "SaltySD only works when the loader matches your");
-    drawText(36, 110, 0.42f, T.muted,
-             "game's exact revision. If the game crashes at boot,");
-    drawText(36, 128, 0.42f, T.muted,
-             "come back here and try another copy.");
-    drawText(36, 156, 0.42f, T.muted, G_A " install    " G_B " back");
+    drawCard(20, 52, 360, 150);
+    drawText(36, 62, 0.55f, CLR_WHITE,
+             g_saltyGen == 2 ? "Now: v2 (.3gx plugin)" : "Now: v1.2 (code.ips)");
+    drawText(36, 88, 0.42f, T.muted,
+             "v2 .3gx: drop the release on the SD, pick it here,");
+    drawText(36, 105, 0.42f, T.muted,
+             "then enable Rosalina's Plugin Loader. USA and");
+    drawText(36, 122, 0.42f, T.muted,
+             "EUR/JPN builds differ. v1 code.ips must match the");
+    drawText(36, 139, 0.42f, T.muted,
+             "game revision. Picking one parks the other.");
+    if (g_codeSrc.known) {
+        char line[96];
+        if (g_codeSrc.cart)
+            snprintf(line, sizeof(line), "Game runs: cartridge code (v%u%s)",
+                     g_codeSrc.cartVer,
+                     g_codeSrc.hasUpd ? ", newer than the update" : "");
+        else if (g_codeSrc.hasUpd)
+            snprintf(line, sizeof(line), "Game runs: update code (v%u)",
+                     g_codeSrc.updVer);
+        else
+            snprintf(line, sizeof(line), "Game runs: base code (no update)");
+        drawText(36, 156, 0.42f, g_codeSrc.cart ? CLR_YELLOW : T.info, line);
+    }
+    drawText(36, 172, 0.42f, T.muted, G_A " install    " G_B " back");
     drawTopFooter();
 }
 
@@ -2753,7 +3429,9 @@ static void drawBottomMods(const GameProfile &gp, const std::vector<ModEntry> &m
                            int cursor, const Status &st)
 {
     drawBottomChrome(gp.title, cursor, (int)mods.size(),
-                     G_A " Use  " G_X " Vanilla  " G_Y " Tidy  " G_B " Back",
+                     g_saltyGen == 2
+                         ? G_A " On/Off  " G_X " All off  " G_Y " Tidy  " G_B " Back"
+                         : G_A " Use  " G_X " Vanilla  " G_Y " Tidy  " G_B " Back",
                      true);
 
     if (mods.empty()) {
@@ -2768,11 +3446,14 @@ static void drawBottomMods(const GameProfile &gp, const std::vector<ModEntry> &m
 
         for (int i = start; i < end; ++i) {
             const ModEntry &m = mods[i];
-            const char *badge = m.active ? "ACTIVE"
-                              : m.loose  ? "LOOSE"
-                              : m.loader ? "SETUP" : "";
+            const char *badge = m.active   ? (g_saltyGen == 2 ? "ON" : "ACTIVE")
+                              : m.off      ? "OFF"
+                              : m.leftover ? "OLD v1"
+                              : m.loose    ? "LOOSE"
+                              : m.loader   ? "SETUP" : "";
             drawListRow(i - start, m.display, i == cursor, badge,
-                        m.active ? CLR_GREEN : m.loader ? T.info : CLR_ORANGE);
+                        m.active ? CLR_GREEN : m.off ? CLR_YELLOW
+                                 : m.loader ? T.info : CLR_ORANGE);
         }
 
         drawScrollbar(total, start);
@@ -2788,15 +3469,18 @@ static void drawBottomLoader(const std::vector<ModEntry> &cands, int cursor,
     drawBottomChrome("Choose loader", cursor, (int)cands.size(),
                      G_A " Install  " G_B " Back", true);
     if (cands.empty()) {
-        drawTextCenter(160, 100, 0.5f, T.muted, "No code.ips found");
+        drawTextCenter(160, 100, 0.5f, T.muted, "No .3gx or code.ips found");
         drawTextCenter(160, 125, 0.4f, T.muted,
-                       "Put one in a mod folder or the repo root");
+                       "Put saltysd.3gx on the SD root or in the repo");
     } else {
         int start, end;
         viewport((int)cands.size(), cursor, start, end);
         trackSelection(cursor - start);
-        for (int i = start; i < end; ++i)
-            drawListRow(i - start, cands[i].display, i == cursor, "", 0);
+        for (int i = start; i < end; ++i) {
+            const bool v2 = isV2Loader(cands[i]);
+            drawListRow(i - start, cands[i].display, i == cursor,
+                        v2 ? "v2" : "v1", v2 ? CLR_GREEN : T.info);
+        }
         drawScrollbar((int)cands.size(), start);
     }
     drawStatus(st);
@@ -3063,7 +3747,16 @@ int main(int argc, char **argv)
                 }
                 modCursor = 0;
                 status    = { "", SK_NEUTRAL };
-                g_saltyLoaderOk = ensureSaltyLoader(profiles[selected]);
+                const GameProfile &gp = profiles[selected];
+                g_saltyLoaderOk = ensureSaltyLoader(gp);
+                g_saltyGen      = saltyGenOf(gp);
+                g_plgState      = g_saltyGen == 2 ? pluginLoaderState() : -1;
+                refreshV2Check(gp);
+                if (g_saltyParkedV1) {
+                    status = { "Parked the old v1 code.ips (v2 is installed)",
+                               SK_OK };
+                    mods = rescanMods(gp);
+                }
                 state = ST_MODS;
                 sndPlay(SND_CONFIRM);
             }
@@ -3107,9 +3800,12 @@ int main(int argc, char **argv)
                 gameCursor = selected;
                 // `mods` is already fresh (rescanned after every action), so
                 // derive the stats from it - zero SD reads on backout.
-                profiles[selected].modCount  = (int)mods.size();
+                profiles[selected].modCount  = (int)std::count_if(
+                    mods.begin(), mods.end(),
+                    [](const ModEntry &m) { return !m.loader; });
                 profiles[selected].hasActive =
                     !mods.empty() && mods.front().active;
+                profiles[selected].saltyGen  = g_saltyGen;
                 sndPlay(SND_BACK);
             }
             else if (kDown & KEY_SELECT) {
@@ -3137,6 +3833,8 @@ int main(int argc, char **argv)
                     } else {
                         // On success the activated mod sorts to the top;
                         // follow it so the selection tracks what you did.
+                        // (v2 toggles move mods both ways: find it by name.)
+                        const std::string name = mods[modCursor].display;
                         if (activateMod(gp, mods[modCursor], &status)) {
                             modCursor = 0;
                             sndPlay(SND_CONFIRM);
@@ -3144,6 +3842,9 @@ int main(int argc, char **argv)
                             sndPlay(SND_ERROR);
                         }
                         refreshModList(gp);
+                        if (g_saltyGen == 2)
+                            for (int i = 0; i < (int)mods.size(); ++i)
+                                if (mods[i].display == name) { modCursor = i; break; }
                     }
                 }
             }
@@ -3172,6 +3873,8 @@ int main(int argc, char **argv)
                 sndPlay(installLoader(profiles[selected],
                                       loaders[loaderCursor], &status)
                             ? SND_CONFIRM : SND_ERROR);
+                // Switching generation changes how the mods are laid out.
+                refreshModList(profiles[selected]);
                 state = ST_MODS;
             }
         }
